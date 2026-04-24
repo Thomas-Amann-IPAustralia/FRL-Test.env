@@ -453,21 +453,30 @@ def _extract_summary_from_html(html: str) -> tuple[str, str]:
     """
     Extract (bill_title, summary_text) from a ParlInfo bill home HTML page.
 
-    ParlInfo uses HTML5 <details>/<summary> accordions. The page structure is:
-      <details>
-        <summary><b class="bills">Summary</b></summary>  ← XPATH target
-        <p>Actual summary content...</p>
-        ...
-      </details>
-      <details>
-        <summary><b class="bills">Progress of bill</b></summary>
-        ...
-      </details>
+    ParlInfo uses <summary> as a plain container element (NOT an HTML5
+    details/summary accordion). The XPATH is:
+      /html/body/div[2]/div[2]/div/div[2]/div/div[1]/summary
 
-    The <summary> tag is the HEADING of the accordion, not the content.
-    We must extract the sibling elements INSIDE <details> that follow <summary>.
+    The full bill summary text sits directly inside this <summary> element.
+    soup.find("summary").get_text() retrieves it correctly.
+
+    Three strategies are tried in order:
+      1. Direct <summary> element — the primary ParlInfo structure.
+      2. b.bills marker layout — legacy/alternate ParlInfo layout where
+         content sits between <b class="bills">Summary</b> and
+         <b class="bills">Progress of bill</b>.
+      3. Broad text scan — last resort for unexpected page structures.
     """
     soup = BeautifulSoup(html, "html.parser")
+
+    # Log a diagnostic snippet so structure issues are visible in the log
+    body_text = soup.get_text(separator=" ", strip=True)
+    log(f"    Page text length: {len(body_text)} chars, word count: {len(body_text.split())}")
+    summary_els = soup.find_all("summary")
+    log(f"    <summary> elements found: {len(summary_els)}")
+    for i, el in enumerate(summary_els[:3]):
+        preview = el.get_text(separator=" ", strip=True)[:120]
+        log(f"      summary[{i}]: {preview!r}")
 
     # Bill title
     bill_title = ""
@@ -475,39 +484,26 @@ def _extract_summary_from_html(html: str) -> tuple[str, str]:
         el = soup.select_one(selector)
         if el:
             candidate = el.get_text(strip=True)
-            # Skip generic page titles
             if len(candidate) > 10 and "parlinfo" not in candidate.lower():
                 bill_title = candidate
                 break
 
     # -----------------------------------------------------------------------
-    # Strategy 1: <details> element whose <summary> heading says "Summary"
-    # Extract content from INSIDE <details> AFTER the <summary> heading.
+    # Strategy 1: direct <summary> element
+    # ParlInfo uses <summary> as a plain content container, not an accordion.
     # XPATH: /html/body/div[2]/div[2]/div/div[2]/div/div[1]/summary
     # -----------------------------------------------------------------------
-    for details in soup.find_all("details"):
-        heading = details.find("summary")
-        if not heading:
-            continue
-        heading_text = heading.get_text(strip=True)
-        if not re.search(r"\bSummary\b", heading_text, re.IGNORECASE):
-            continue
-        # Collect all content nodes inside <details> that are not the heading
-        chunks = []
-        for child in details.children:
-            if child is heading:
-                continue
-            if hasattr(child, "get_text"):
-                text = child.get_text(separator=" ", strip=True)
-                if text:
-                    chunks.append(text)
-        if chunks:
-            text = " ".join(chunks)
-            log(f"    <details>/<summary> pattern: {len(text.split())} words")
+    summary_el = soup.find("summary")
+    if summary_el:
+        text = summary_el.get_text(separator=" ", strip=True)
+        if len(text.split()) >= 10:
+            log(f"    Strategy 1 (<summary> direct): {len(text.split())} words")
             return bill_title, text
+        else:
+            log(f"    Strategy 1: <summary> found but only {len(text.split())} words — continuing")
 
     # -----------------------------------------------------------------------
-    # Strategy 2: legacy b.bills marker layout
+    # Strategy 2: b.bills marker layout
     # Content between <b class="bills">Summary</b> and
     # <b class="bills">Progress of bill</b>
     # -----------------------------------------------------------------------
@@ -536,19 +532,24 @@ def _extract_summary_from_html(html: str) -> tuple[str, str]:
                     chunks.append(text)
         if chunks:
             text = " ".join(chunks)
-            log(f"    b.bills legacy markers: {len(text.split())} words")
+            log(f"    Strategy 2 (b.bills markers): {len(text.split())} words")
             return bill_title, text
 
     # -----------------------------------------------------------------------
-    # Strategy 3: any <details> block (fall through for unusual structures)
+    # Strategy 3: any element with substantial text near "Summary" heading
+    # Last resort for unexpected page structures.
     # -----------------------------------------------------------------------
-    for details in soup.find_all("details"):
-        text = details.get_text(separator=" ", strip=True)
-        if len(text.split()) >= 30:
-            log(f"    <details> fallback: {len(text.split())} words")
-            return bill_title, text
+    for tag in soup.find_all(["div", "section", "article", "p"]):
+        attrs_str = " ".join(str(v) for v in tag.attrs.values()).lower()
+        if "summary" in attrs_str:
+            text = tag.get_text(separator=" ", strip=True)
+            if len(text.split()) >= 20:
+                log(f"    Strategy 3 (summary attr): {len(text.split())} words")
+                return bill_title, text
 
-    log("    WARNING: Could not locate summary content in HTML")
+    log("    WARNING: No extraction strategy succeeded")
+    # Dump the first 1000 chars of page text to help diagnose
+    log(f"    Page preview: {body_text[:500]!r}")
     return bill_title, ""
 
 
