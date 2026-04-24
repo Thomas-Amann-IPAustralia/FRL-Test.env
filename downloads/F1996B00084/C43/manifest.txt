@@ -1,0 +1,13 @@
+ES Download Manifest
+============================================================
+Principal Title ID : F1996B00084
+Compilation        : C43
+Run at (UTC)       : 2026-04-24T02:10:08.410140+00:00
+
+Amending instruments found : 1
+Documents downloaded       : 1
+Not found                  : 0
+Errors                     : 0
+
+------------------------------------------------------------
+✓  F2018L01435     affect=Amend         status=success     source=web   file=ES_F2018L01435_C43.docx

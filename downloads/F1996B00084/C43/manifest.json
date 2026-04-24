@@ -1,0 +1,22 @@
+{
+  "titleId": "F1996B00084",
+  "compilation": "C43",
+  "amendingInstruments": [
+    {
+      "titleId": "F2018L01435",
+      "name": "",
+      "affect": "Amend"
+    }
+  ],
+  "downloads": [
+    {
+      "titleId": "F2018L01435",
+      "status": "success",
+      "type": "ES (web)",
+      "source": "web",
+      "filename": "ES_F2018L01435_C43.docx",
+      "http_status": 200,
+      "error": null
+    }
+  ]
+}
