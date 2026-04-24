@@ -1,51 +1,76 @@
-name: Download Amending ES Documents
 
+Copy
+
+name: Download ES Documents
+ 
 on:
   workflow_dispatch:
     inputs:
       legislation_url:
-        description: 'URL of the regulation'
+        description: >
+          URL of any version of the principal regulation on legislation.gov.au
+          (e.g. https://www.legislation.gov.au/F1996B00084/latest/text)
         required: true
-        default: 'https://www.legislation.gov.au/F1996B00084/latest/text'
+        default: "https://www.legislation.gov.au/F1996B00084/latest/text"
+        type: string
+ 
       compilation_number:
-        description: 'Compilation Number (e.g., C51)'
+        description: >
+          Compilation number to inspect (e.g. C51 or 51 — the leading "C" is optional)
         required: true
-        default: 'C51'
-
+        default: "C51"
+        type: string
+ 
 jobs:
-  download-and-commit:
+  download-es:
+    name: Download ES — ${{ github.event.inputs.compilation_number }}
     runs-on: ubuntu-latest
+ 
     permissions:
-      contents: write
-    
+      contents: write   # required to commit the downloaded files back to the repo
+ 
     steps:
-      - name: Checkout Repository
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+ 
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
-
-      - name: Install Dependencies
-        run: pip install requests
-
-      - name: Run Download Script
-        env:
-          URL: ${{ github.event.inputs.legislation_url }}
-          COMP_NUM: ${{ github.event.inputs.legislation_url }}
-        run: python download_es.py "${{ github.event.inputs.legislation_url }}" "${{ github.event.inputs.compilation_number }}"
-
-      - name: Commit and Push ES Documents
+          python-version: "3.11"
+ 
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
         run: |
-          git config --global user.name "github-actions[bot]"
+          pip install --quiet requests
+ 
+      # -----------------------------------------------------------------------
+      - name: Run ES downloader
+        run: |
+          python download_es.py \
+            "${{ github.event.inputs.legislation_url }}" \
+            "${{ github.event.inputs.compilation_number }}"
+ 
+      # -----------------------------------------------------------------------
+      - name: Commit and push downloaded files
+        run: |
+          git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Check if the directory exists and has files before trying to add
-          if [ -d "downloads" ] && [ "$(ls -A downloads)" ]; then
-            git add downloads/
-            git commit -m "Add ES documents for compilation ${{ github.event.inputs.compilation_number }}"
-            git push
+ 
+          # Stage everything that was written under downloads/
+          git add downloads/
+ 
+          # Only commit if there is something new or changed
+          if git diff --cached --quiet; then
+            echo "Nothing to commit — all files already present in the repo."
           else
-            echo "No files were downloaded. Skipping git commit."
+            git commit -m \
+              "feat: ES documents for ${{ github.event.inputs.compilation_number }} [automated]
+ 
+          Principal URL : ${{ github.event.inputs.legislation_url }}
+          Compilation   : ${{ github.event.inputs.compilation_number }}
+          Triggered by  : ${{ github.actor }}"
+ 
+            git push
           fi
