@@ -506,4 +506,397 @@ def _extract_summary_from_html(html: str) -> tuple[str, str]:
     # -----------------------------------------------------------------------
     summary_el = soup.find("summary")
     if summary_el:
-        summary_text
+        summary_text = summary_el.get_text(separator=" ", strip=True)
+
+        # Check if this <summary> is inside a <details> (variant B)
+        parent_details = summary_el.find_parent("details")
+        if parent_details:
+            # Collect ALL text inside <details>: summary heading + sibling content
+            chunks = []
+            for child in parent_details.children:
+                if hasattr(child, "get_text"):
+                    t = child.get_text(separator=" ", strip=True)
+                    if t:
+                        chunks.append(t)
+            full_text = " ".join(chunks)
+            log(f"    Strategy 1B (<details>+<summary>): {len(full_text.split())} words")
+            if len(full_text.split()) >= 10:
+                return bill_title, full_text
+
+        # Variant A: standalone <summary> container
+        if len(summary_text.split()) >= 10:
+            log(f"    Strategy 1A (<summary> standalone): {len(summary_text.split())} words")
+            return bill_title, summary_text
+
+        log(f"    Strategy 1: <summary> found but only {len(summary_text.split())} words — continuing")
+
+    # -----------------------------------------------------------------------
+    # Strategy 2: b.bills marker layout
+    # Content between <b class="bills">Summary</b> and
+    # <b class="bills">Progress of bill</b>
+    # -----------------------------------------------------------------------
+    summary_b = None
+    for b_tag in soup.find_all("b", class_="bills"):
+        if re.search(r"\bSummary\b", b_tag.get_text(), re.IGNORECASE):
+            summary_b = b_tag
+            break
+
+    if summary_b:
+        chunks = []
+        for sibling in summary_b.parent.next_siblings:
+            if hasattr(sibling, "find_all"):
+                stop = any(
+                    re.search(r"Progress of bill", b.get_text(), re.IGNORECASE)
+                    for b in sibling.find_all("b", class_="bills")
+                )
+                if stop:
+                    break
+                chunk = sibling.get_text(separator=" ", strip=True)
+                if chunk:
+                    chunks.append(chunk)
+            elif hasattr(sibling, "strip"):
+                text = str(sibling).strip()
+                if text and not text.startswith("<"):
+                    chunks.append(text)
+        if chunks:
+            text = " ".join(chunks)
+            log(f"    Strategy 2 (b.bills markers): {len(text.split())} words")
+            return bill_title, text
+
+    # -----------------------------------------------------------------------
+    # Strategy 3: any element with substantial text near "Summary" heading
+    # Last resort for unexpected page structures.
+    # -----------------------------------------------------------------------
+    for tag in soup.find_all(["div", "section", "article", "p"]):
+        attrs_str = " ".join(str(v) for v in tag.attrs.values()).lower()
+        if "summary" in attrs_str:
+            text = tag.get_text(separator=" ", strip=True)
+            if len(text.split()) >= 20:
+                log(f"    Strategy 3 (summary attr): {len(text.split())} words")
+                return bill_title, text
+
+    log("    WARNING: No extraction strategy succeeded")
+    # Dump the first 1000 chars of page text to help diagnose
+    log(f"    Page preview: {body_text[:500]!r}")
+    return bill_title, ""
+
+
+def scrape_bill_summary(parlinfo_url: str) -> tuple[str, str]:
+    """
+    Fetch and parse a ParlInfo bill home page.
+    Returns (bill_title, summary_text).
+    Raises RuntimeError if the page cannot be fetched.
+    """
+    log(f"  Scraping ParlInfo -> {parlinfo_url}")
+    html = _fetch_parlinfo_html(parlinfo_url)
+    return _extract_summary_from_html(html)
+
+
+# ---------------------------------------------------------------------------
+# Bills Digest fallback
+# ---------------------------------------------------------------------------
+def extract_bill_id(parlinfo_url: str) -> str | None:
+    match = re.search(r"billhome[/%2F]+([a-zA-Z][0-9]+)", parlinfo_url, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def scrape_bills_digest(bill_id: str) -> str:
+    """Fetch Bills Digest and extract Key Points section."""
+    search_url = (
+        f"{PARLINFO_DISPLAY}"
+        f";query=BillId_Phrase%3A%22{bill_id}%22%20Dataset%3Abillsdgs;rec=0"
+    )
+    log(f"  Bills Digest -> {search_url}")
+    try:
+        # Use stealth fetch — Bills Digest is on the same WAF-protected domain
+        html = _fetch_parlinfo_html(search_url)
+    except Exception as exc:
+        log(f"    Bills Digest failed: {exc}")
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    key_points_marker = None
+    for tag in soup.find_all(["p", "h2", "h3", "strong", "b"]):
+        if re.search(r"key\s+points", tag.get_text(), re.IGNORECASE):
+            key_points_marker = tag
+            break
+
+    if not key_points_marker:
+        log("    'Key points' marker not found")
+        return ""
+
+    chunks = []
+    for sibling in key_points_marker.next_siblings:
+        if hasattr(sibling, "get_text"):
+            text = sibling.get_text(strip=True)
+            if re.search(r"^\s*Contents?\s*$", text, re.IGNORECASE):
+                break
+            if text:
+                chunks.append(text)
+        elif str(sibling).strip():
+            chunks.append(str(sibling).strip())
+
+    if chunks:
+        text = " ".join(chunks)
+        log(f"    Bills Digest key points: {len(text.split())} words")
+        return text
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Per-Act orchestration
+# ---------------------------------------------------------------------------
+def process_amending_act(act: dict) -> dict:
+    tid = act["titleId"]
+    result = {
+        "titleId": tid,
+        "name": act.get("name", ""),
+        "affect": act.get("affect", ""),
+        "discovery_source": act.get("source", ""),
+        "parlinfo_url": None,
+        "bill_id": None,
+        "bill_title": "",
+        "summary": "",
+        "summary_source": "",
+        "status": "not_found",
+    }
+
+    parlinfo_url = find_parlinfo_url(tid)
+    if not parlinfo_url:
+        log(f"  Could not find a ParlInfo URL for {tid}")
+        result["status"] = "no_parlinfo_url"
+        return result
+
+    result["parlinfo_url"] = parlinfo_url
+    result["bill_id"] = extract_bill_id(parlinfo_url)
+
+    try:
+        bill_title, summary = scrape_bill_summary(parlinfo_url)
+    except Exception as exc:
+        import traceback
+        log(f"  ParlInfo scrape failed: {exc}")
+        log(f"  Traceback: {traceback.format_exc()}")
+        result["status"] = "scrape_error"
+        return result
+
+    result["bill_title"] = bill_title
+    word_count = len(summary.split())
+    log(f"  Summary word count: {word_count}")
+
+    if word_count >= MIN_SUMMARY_WORDS:
+        result["summary"] = summary
+        result["summary_source"] = "parlinfo_bill_home"
+        result["status"] = "success"
+        return result
+
+    log(f"  < {MIN_SUMMARY_WORDS} words — trying Bills Digest ...")
+    digest = scrape_bills_digest(result["bill_id"]) if result["bill_id"] else ""
+
+    if digest and len(digest.split()) >= 30:
+        result["summary"] = digest
+        result["summary_source"] = "bills_digest"
+        result["status"] = "success"
+        return result
+
+    if summary:
+        result["summary"] = summary
+        result["summary_source"] = "parlinfo_bill_home_short"
+        result["status"] = "success_short"
+        return result
+
+    result["status"] = "no_summary_found"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+def generate_report(
+    principal_title_id: str,
+    compilation_label: str,
+    results: list[dict],
+) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "# EM Summary Report",
+        "",
+        f"**Principal Act:** [{principal_title_id}]({LEGISLATION_BASE}/{principal_title_id}/latest/versions)  ",
+        f"**Compilation:** {compilation_label}  ",
+        f"**Generated:** {now}  ",
+        "",
+        "---",
+        "",
+    ]
+
+    if not results:
+        lines.append("No amending Acts were identified for this compilation.")
+        return "\n".join(lines)
+
+    success_count = sum(1 for r in results if r["status"].startswith("success"))
+    lines.append(
+        f"Found **{len(results)}** amending Act(s). "
+        f"EM summaries retrieved for **{success_count}**."
+    )
+    lines.append("")
+
+    for i, res in enumerate(results, 1):
+        tid = res["titleId"]
+        name = res.get("name") or tid
+        bill_title = res.get("bill_title") or name
+        parlinfo_url = res.get("parlinfo_url") or ""
+        summary = res.get("summary", "").strip()
+        source = res.get("summary_source", "")
+        status = res.get("status", "")
+
+        lines.append(f"## {i}. {name}")
+        lines.append("")
+        lines.append(f"- **Amending Act:** [{tid}]({LEGISLATION_BASE}/{tid}/latest/versions)")
+        lines.append(f"- **Discovered via:** {res.get('discovery_source', '-')}")
+        if bill_title and bill_title != name:
+            lines.append(f"- **Bill:** {bill_title}")
+        if parlinfo_url:
+            lines.append(f"- **ParlInfo:** [{parlinfo_url}]({parlinfo_url})")
+        if res.get("bill_id"):
+            lines.append(f"- **Bill ID:** {res['bill_id']}")
+        source_label = {
+            "parlinfo_bill_home": "ParlInfo Bill Home – Summary",
+            "parlinfo_bill_home_short": "ParlInfo Bill Home – Summary (< 100 words)",
+            "bills_digest": "Bills Digest – Key Points",
+        }.get(source, source or "-")
+        lines.append(f"- **Summary source:** {source_label}")
+        lines.append("")
+
+        if summary:
+            lines.append("### Plain-English Summary")
+            lines.append("")
+            lines.append(summary)
+        elif status == "no_parlinfo_url":
+            lines.append(
+                "> ⚠️ No ParlInfo bill home link found on the legislation.gov.au page for this Act. "
+                "It may be a commencement or administrative instrument with no EM."
+            )
+        elif status == "scrape_error":
+            lines.append(
+                "> ⚠️ Found the ParlInfo URL but could not retrieve summary content. "
+                "Check the link above manually."
+            )
+        else:
+            lines.append("> ⚠️ No summary text could be extracted. Check the ParlInfo link above.")
+
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_step_summary(report_md: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(report_md)
+    log("GitHub Step Summary written.")
+
+
+def write_output_file(report_md: str, title_id: str, compilation_label: str) -> str:
+    from pathlib import Path
+    out_dir = Path("em_summaries") / title_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"EM_summary_{title_id}_{compilation_label}.md"
+    out_path = out_dir / filename
+    out_path.write_text(report_md, encoding="utf-8")
+    log(f"Report written -> {out_path}")
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    if len(sys.argv) < 3:
+        print(
+            "Usage: python fetch_em_summary.py <legislation_url> <compilation_number>\n"
+            "Example: python fetch_em_summary.py "
+            "https://www.legislation.gov.au/C2004A04014/latest/versions C50"
+        )
+        sys.exit(1)
+
+    url_input = sys.argv[1].strip()
+    comp_input = sys.argv[2].strip().upper()
+
+    log_section("FRL EM Summary Fetcher")
+    log(f"Input URL   : {url_input}")
+    log(f"Compilation : {comp_input}")
+
+    try:
+        title_id = extract_title_id(url_input)
+    except ValueError as exc:
+        log(f"ERROR: {exc}")
+        sys.exit(1)
+    log(f"Title ID    : {title_id}")
+
+    log_section("Fetching compilation from FRL API")
+    try:
+        version_data = get_compilation(title_id, comp_input)
+    except RuntimeError as exc:
+        log(f"ERROR: {exc}")
+        sys.exit(1)
+
+    register_id = version_data.get("registerId", "unknown")
+    start = version_data.get("start", "")
+    log(f"Register ID : {register_id}")
+    log(f"Start date  : {start[:10] if start else 'unknown'}")
+
+    version_data.setdefault("titleId", title_id)
+
+    log_section("Discovering amending Acts")
+    amending_acts = discover_amending_acts(version_data)
+
+    if not amending_acts:
+        log("No amending Acts found via any discovery method.")
+        report = (
+            f"# EM Summary Report\n\n"
+            f"**Principal Act:** {title_id}  \n"
+            f"**Compilation:** {comp_input}  \n\n"
+            f"No amending Acts were found for this compilation.\n"
+        )
+        write_step_summary(report)
+        write_output_file(report, title_id, comp_input)
+        sys.exit(0)
+
+    log(f"Found {len(amending_acts)} amending Act(s):")
+    for act in amending_acts:
+        log(f"  * {act['titleId']}  (via {act['source']})  {act.get('name', '')}")
+
+    log_section("Retrieving EM summaries from ParlInfo")
+    results = []
+    for act in amending_acts:
+        log(f"\nProcessing {act['titleId']} ...")
+        result = process_amending_act(act)
+        results.append(result)
+
+    log_section("Generating report")
+    report_md = generate_report(title_id, comp_input, results)
+
+    print("\n" + "=" * 60)
+    print(report_md)
+    print("=" * 60)
+
+    out_path = write_output_file(report_md, title_id, comp_input)
+    write_step_summary(report_md)
+
+    success_count = sum(1 for r in results if r["status"].startswith("success"))
+    log_section("Complete")
+    log(f"{success_count}/{len(results)} summaries retrieved.")
+    log(f"Report saved -> {out_path}")
+
+    if success_count == 0:
+        log("WARNING: No summaries retrieved. Exiting with code 1.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
