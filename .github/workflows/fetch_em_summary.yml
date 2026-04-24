@@ -28,11 +28,11 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write   # needed to upload the report as an artifact
+      contents: write
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout repo (needed so the script is available on the runner)
+      # 1. Checkout repo
       # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,15 +46,29 @@ jobs:
           python-version: "3.12"
 
       # -----------------------------------------------------------------------
-      # 3. Install dependencies
+      # 3. Install Python dependencies
       # -----------------------------------------------------------------------
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+          pip install requests beautifulsoup4 lxml playwright
 
       # -----------------------------------------------------------------------
-      # 4. Run the EM summary fetcher
+      # 4. Install Chromium for Playwright
+      #
+      #    ParlInfo (parlinfo.aph.gov.au) is protected by an Azure WAF JS
+      #    Challenge that blocks plain HTTP clients. Playwright drives a real
+      #    headless Chromium browser, which executes the challenge JavaScript
+      #    and retrieves the page content transparently.
+      #
+      #    --with-deps installs the OS-level shared libraries Chromium needs
+      #    on the ubuntu-latest runner.
+      # -----------------------------------------------------------------------
+      - name: Install Chromium for Playwright
+        run: playwright install chromium --with-deps
+
+      # -----------------------------------------------------------------------
+      # 5. Run the EM summary fetcher
       # -----------------------------------------------------------------------
       - name: Fetch EM Summary
         env:
@@ -66,7 +80,7 @@ jobs:
             "$COMPILATION_NUMBER"
 
       # -----------------------------------------------------------------------
-      # 5. Upload the generated report as a workflow artifact
+      # 6. Upload the generated report as a workflow artifact
       #    (retained for 30 days; downloadable from the Actions run page)
       # -----------------------------------------------------------------------
       - name: Upload report artifact
