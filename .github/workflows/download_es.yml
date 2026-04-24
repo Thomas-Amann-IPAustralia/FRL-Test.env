@@ -40,6 +40,12 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/*.docx
-          git commit -m "Add ES documents for compilation ${{ github.event.inputs.compilation_number }}" || echo "No changes to commit"
-          git push
+          
+          # Check if the directory exists and has files before trying to add
+          if [ -d "downloads" ] && [ "$(ls -A downloads)" ]; then
+            git add downloads/
+            git commit -m "Add ES documents for compilation ${{ github.event.inputs.compilation_number }}"
+            git push
+          else
+            echo "No files were downloaded. Skipping git commit."
+          fi
