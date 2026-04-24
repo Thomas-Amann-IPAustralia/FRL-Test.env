@@ -383,8 +383,12 @@ def _fetch_parlinfo_html(parlinfo_url: str) -> str:
                 last_status = resp.status_code
                 if resp.status_code == 200 and len(resp.text) > 200:
                     log(f"    HTTP 200 ({len(resp.text)} chars)")
+                    # Log a snippet so we can verify we got the right page
+                    preview = resp.text[:500].replace("\n", " ").strip()
+                    log(f"    HTML preview: {preview!r}")
                     return resp.text
-                log(f"    HTTP {resp.status_code}")
+                body_preview = resp.text[:300].replace("\n", " ").strip()
+                log(f"    HTTP {resp.status_code} body_preview={body_preview!r}")
             except Exception as exc:
                 log(f"    Request error: {exc}")
 
@@ -591,7 +595,9 @@ def process_amending_act(act: dict) -> dict:
     try:
         bill_title, summary = scrape_bill_summary(parlinfo_url)
     except Exception as exc:
+        import traceback
         log(f"  ParlInfo scrape failed: {exc}")
+        log(f"  Traceback: {traceback.format_exc()}")
         result["status"] = "scrape_error"
         return result
 
