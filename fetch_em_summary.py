@@ -340,61 +340,90 @@ def find_parlinfo_url(amending_act_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # ParlInfo bill home scraping
 # ---------------------------------------------------------------------------
-def _fetch_parlinfo_html(parlinfo_url: str) -> str:
+def _fetch_with_playwright(url: str) -> str:
     """
-    Fetch HTML from a ParlInfo URL, trying the ; and ? forms and two header sets.
-    Returns the HTML string, or raises on complete failure.
+    Fetch a page using a headless Chromium browser via playwright.
+    This passes Azure WAF JS challenges that block plain HTTP clients.
     """
-    # ParlInfo uses semicolons as path parameter separators.
-    # Try both ; and ? forms in case the server prefers one.
-    url_variants = [parlinfo_url]
-    if ";" in parlinfo_url:
-        url_variants.append(parlinfo_url.replace(";", "?", 1))
-
-    header_sets = [
-        {
-            "User-Agent": (
+    from playwright.sync_api import sync_playwright
+    log(f"    Playwright: launching Chromium for {url[:80]}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-AU,en-GB;q=0.9,en;q=0.8",
-            "Referer": "https://www.legislation.gov.au/",
-        },
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.4 Safari/605.1.15"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-AU,en;q=0.5",
-            "Referer": "https://www.aph.gov.au/",
-        },
-    ]
+            locale="en-AU",
+            extra_http_headers={"Referer": "https://www.legislation.gov.au/"},
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="networkidle", timeout=45000)
+        # Give the WAF JS challenge time to execute and redirect
+        page.wait_for_load_state("networkidle")
+        html = page.content()
+        browser.close()
+    log(f"    Playwright: got {len(html)} chars")
+    return html
+
+
+def _fetch_parlinfo_html(parlinfo_url: str) -> str:
+    """
+    Fetch HTML from a ParlInfo URL.
+
+    ParlInfo (parlinfo.aph.gov.au) is protected by an Azure WAF JS Challenge
+    that returns HTTP 403 to plain HTTP clients regardless of headers. A real
+    browser is required to pass the JavaScript challenge.
+
+    Primary:  playwright (headless Chromium) — passes the WAF challenge.
+    Fallback: requests — used if playwright is not installed, or for testing.
+    """
+    # Try playwright first
+    try:
+        html = _fetch_with_playwright(parlinfo_url)
+        if len(html) > 500 and "Azure WAF" not in html:
+            return html
+        log(f"    Playwright returned WAF page or short response — unexpected")
+    except ImportError:
+        log("    playwright not installed — falling back to requests")
+    except Exception as exc:
+        log(f"    Playwright failed: {exc} — falling back to requests")
+
+    # Fallback: requests (will 403 on the live site but useful for local testing)
+    url_variants = [parlinfo_url]
+    if ";" in parlinfo_url:
+        url_variants.append(parlinfo_url.replace(";", "?", 1))
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-AU,en-GB;q=0.9,en;q=0.8",
+        "Referer": "https://www.legislation.gov.au/",
+    }
 
     last_status = None
     for url in url_variants:
-        for headers in header_sets:
-            log(f"    GET {url[:100]}")
-            try:
-                resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-                last_status = resp.status_code
-                if resp.status_code == 200 and len(resp.text) > 200:
-                    log(f"    HTTP 200 ({len(resp.text)} chars)")
-                    # Log a snippet so we can verify we got the right page
-                    preview = resp.text[:500].replace("\n", " ").strip()
-                    log(f"    HTML preview: {preview!r}")
-                    return resp.text
-                body_preview = resp.text[:300].replace("\n", " ").strip()
-                log(f"    HTTP {resp.status_code} body_preview={body_preview!r}")
-            except Exception as exc:
-                log(f"    Request error: {exc}")
+        log(f"    requests GET {url[:100]}")
+        try:
+            resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+            last_status = resp.status_code
+            if resp.status_code == 200 and len(resp.text) > 200:
+                log(f"    HTTP 200 ({len(resp.text)} chars)")
+                return resp.text
+            preview = resp.text[:200].replace("\n", " ").strip()
+            log(f"    HTTP {resp.status_code}: {preview!r}")
+        except Exception as exc:
+            log(f"    Request error: {exc}")
 
     raise RuntimeError(
-        f"Could not retrieve ParlInfo page after all attempts "
-        f"(last status: {last_status}). URL: {parlinfo_url}"
+        f"Could not retrieve ParlInfo page (last status: {last_status}). "
+        f"Ensure playwright is installed: pip install playwright && "
+        f"playwright install chromium --with-deps"
     )
 
 
