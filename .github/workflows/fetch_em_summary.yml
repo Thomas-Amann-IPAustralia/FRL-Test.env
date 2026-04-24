@@ -1,0 +1,80 @@
+name: Fetch EM Summary
+
+# ---------------------------------------------------------------------------
+# Manual trigger with two user-supplied inputs:
+#   - legislation_url  : any legislation.gov.au URL for the Act to inspect
+#   - compilation_number : e.g. C09, C47 (leading C is optional)
+# ---------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      legislation_url:
+        description: >
+          legislation.gov.au URL for the Act
+          (e.g. https://www.legislation.gov.au/C2015A00040/latest/versions)
+        required: true
+        type: string
+      compilation_number:
+        description: >
+          Compilation number to inspect  (e.g. C09 or C47).
+          The script will find every Act that amended this compilation and
+          retrieve a plain-English summary from ParlInfo.
+        required: true
+        type: string
+
+jobs:
+  fetch-em-summary:
+    name: Retrieve EM Summary
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # needed to upload the report as an artifact
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout repo (needed so the script is available on the runner)
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Set up Python
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # -----------------------------------------------------------------------
+      # 3. Install dependencies
+      # -----------------------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml
+
+      # -----------------------------------------------------------------------
+      # 4. Run the EM summary fetcher
+      # -----------------------------------------------------------------------
+      - name: Fetch EM Summary
+        env:
+          LEGISLATION_URL: ${{ inputs.legislation_url }}
+          COMPILATION_NUMBER: ${{ inputs.compilation_number }}
+        run: |
+          python fetch_em_summary.py \
+            "$LEGISLATION_URL" \
+            "$COMPILATION_NUMBER"
+
+      # -----------------------------------------------------------------------
+      # 5. Upload the generated report as a workflow artifact
+      #    (retained for 30 days; downloadable from the Actions run page)
+      # -----------------------------------------------------------------------
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: em-summary-report
+          path: em_summaries/
+          retention-days: 30
+          if-no-files-found: warn
