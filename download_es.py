@@ -3,9 +3,11 @@ import sys
 import re
 import requests
 
+# Root API URL
 BASE_URL = "https://api.prod.legislation.gov.au/v1"
 
 def extract_title_id(url):
+    """Extracts the 11-character Title ID from a legislation URL."""
     match = re.search(r'/(?P<id>[A-Z0-9]{11})', url)
     if not match:
         raise ValueError(f"Could not extract Title ID from URL: {url}")
@@ -17,68 +19,56 @@ def download_es():
         return
 
     url_input = sys.argv[1]
-    comp_number = sys.argv[2]
-    clean_comp = comp_number.lstrip('C') # Strip 'C' to get just the number string
+    comp_input = sys.argv[2]
+    
+    # Standardize the compilation number (e.g., 'C51' becomes '51')
+    clean_comp = comp_input.upper().lstrip('C').strip()
     title_id = extract_title_id(url_input)
 
-    print(f"--- Diagnostic Start ---")
-    print(f"Targeting Title: {title_id}")
-    print(f"Targeting Compilation: {clean_comp}")
+    print(f"--- Processing Request ---")
+    print(f"Title ID: {title_id} | Compilation: {clean_comp}")
 
-    # FIX: Instead of Versions/Find(...), we query the Versions collection with a $filter.
-    # This is the standard OData way to allow for $expand functionality.
-    version_query_url = (
-        f"{BASE_URL}/Versions?"
-        f"$filter=titleId eq '{title_id}' and compilationNumber eq '{clean_comp}'"
-        f"&$expand=reasons($expand=affect)"
-    )
+    # Step 1: Get the version details using the specialized Find() function.
+    # Note: We do NOT use $expand here because the server prohibits it.
+    version_url = f"{BASE_URL}/Versions/Find(titleId='{title_id}',compilationNumber='{clean_comp}')"
     
-    print(f"Querying: {version_query_url}")
-    response = requests.get(version_query_url)
+    print(f"Fetching compilation details...")
+    response = requests.get(version_url)
     
     if response.status_code != 200:
-        print(f"CRITICAL: API query failed. Status: {response.status_code}")
-        print(f"Response: {response.text}")
+        print(f"CRITICAL: API could not retrieve version. Status: {response.status_code}")
+        print(f"Check if Compilation '{clean_comp}' actually exists for this title.")
         return
 
-    # Data from collection queries is returned inside a 'value' array.
-    results = response.json().get('value', [])
-    if not results:
-        print(f"ERROR: Compilation {clean_comp} not found for title {title_id}.")
-        return
-
-    # Take the first matching version
-    version_data = results[0]
+    version_data = response.json()
+    
+    # The 'reasons' field is provided by default in the Find() response.
     reasons = version_data.get('reasons', [])
-    print(f"Found {len(reasons)} reason entries.")
+    print(f"Found {len(reasons)} amendment reasons.")
 
     amending_ids = set()
     for reason in reasons:
-        # Check 'amendedByTitle' - often a direct ID string
-        direct_id = reason.get('amendedByTitle')
-        if direct_id and isinstance(direct_id, str):
-            amending_ids.add(direct_id)
+        # 'amendedByTitle' is the string field containing the ID of the amending law.
+        aid = reason.get('amendedByTitle')
+        if isinstance(aid, str) and len(aid) == 11:
+            amending_ids.add(aid)
         
-        # Check the 'affect' object which we expanded
+        # Fallback: Check if the 'affect' field itself is a string ID
         affect = reason.get('affect')
-        if isinstance(affect, dict):
-            aid = affect.get('affectingTitleId')
-            if aid:
-                amending_ids.add(aid)
-        elif isinstance(affect, str) and len(affect) == 11:
-            # Fallback if the API returns just the ID string instead of an object
+        if isinstance(affect, str) and len(affect) == 11:
             amending_ids.add(affect)
 
-    print(f"Unique Amending IDs to check: {amending_ids}")
+    print(f"Amending IDs to process: {amending_ids}")
 
     if not amending_ids:
-        print("No amending Title IDs found.")
+        print("No amending IDs were identified. This compilation may not have amending documents.")
         return
 
     os.makedirs("downloads", exist_ok=True)
 
+    # Step 2: Download the Explanatory Statement for each amending ID.
     for amd_id in amending_ids:
-        # Requesting the ES in Word format
+        # We fetch the ES in Word format as originally requested.
         doc_find_url = (
             f"{BASE_URL}/documents/find("
             f"titleid='{amd_id}',"
@@ -91,12 +81,12 @@ def download_es():
         doc_resp = requests.get(doc_find_url)
         
         if doc_resp.status_code == 200:
-            filename = f"downloads/ES_{amd_id}_for_{comp_number}.docx"
+            filename = f"downloads/ES_{amd_id}_for_{comp_input}.docx"
             with open(filename, "wb") as f:
                 f.write(doc_resp.content)
             print(f"SUCCESS: Saved {filename}")
         else:
-            print(f"FAILED: No Word ES for {amd_id} (Status {doc_resp.status_code}).")
+            print(f"FAILED: No Word ES found for {amd_id} (Status {doc_resp.status_code}).")
 
 if __name__ == "__main__":
     download_es()
