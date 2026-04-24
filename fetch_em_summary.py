@@ -9,20 +9,29 @@ $GITHUB_STEP_SUMMARY if running in GitHub Actions).
 Usage:
     python fetch_em_summary.py <legislation_url> <compilation_number>
 
-Examples:
-    python fetch_em_summary.py https://www.legislation.gov.au/C2015A00040/latest/versions C09
-    python fetch_em_summary.py https://www.legislation.gov.au/C2004A04969/latest/versions C47
+How amending Acts are discovered (three-layer approach):
 
-Logic:
-    1. Extract the Title ID from the URL.
-    2. Call FRL API Versions/Find() to get the compilation and its 'reasons'.
-    3. Filter reasons to Acts only (titleId starts with 'C2').
-    4. For each amending Act, call FRL API to get its 'parliamentaryInformation'
-       or fall back to scraping the legislation.gov.au "as made" page to find
-       the ParlInfo bill home URL.
-    5. Scrape the ParlInfo bill home page for the <summary> element.
-    6. If the summary is < 100 words, find and scrape the Bills Digest instead.
-    7. Write a structured plain-English report.
+    Layer 1 — registerId check
+        If the compilation's own registerId matches C####A##### (Act series),
+        that ID IS the amending Act. Common for single-amendment compilations
+        e.g. C2016A00004, C2023A00074.
+
+    Layer 2 — reasons array
+        Walk Version.reasons for amendedByTitle / affectedByTitle entries
+        whose titleId matches C####A#####.
+        Note: this array is sometimes empty even when amendments exist.
+
+    Layer 3 — Affect API endpoint
+        Call GET /v1/Affect?$filter=affectedTitleId eq '{titleId}' and match
+        entries whose start date aligns with this compilation's start date.
+        This is the dedicated FRL endpoint for amendment relationships and is
+        the most reliable source when reasons is empty.
+
+How the ParlInfo EM summary is retrieved:
+    Scrape the amending Act's own legislation.gov.au /latest/versions page
+    for the "Originating Bill and Explanatory Memorandum" ParlInfo link, then:
+    1. Extract the <summary> element or b.bills-delimited content.
+    2. If < 100 words, fall back to the Bills Digest Key Points section.
 """
 
 from __future__ import annotations
@@ -31,9 +40,8 @@ import os
 import re
 import sys
 import json
-import textwrap
 from datetime import datetime, timezone
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -42,19 +50,22 @@ from bs4 import BeautifulSoup
 # Constants
 # ---------------------------------------------------------------------------
 FRL_API = "https://api.prod.legislation.gov.au/v1"
-PARLINFO_BASE = "https://parlinfo.aph.gov.au/parlInfo/search/display/display.w3p"
-BILLS_DIGEST_SEARCH = "https://parlinfo.aph.gov.au/parlInfo/search/display/display.w3p"
+LEGISLATION_BASE = "https://www.legislation.gov.au"
+PARLINFO_DISPLAY = "https://parlinfo.aph.gov.au/parlInfo/search/display/display.w3p"
 
 TITLE_ID_RE = re.compile(r"\b([A-Z][0-9]{4}[A-Z][0-9]{5,6})\b")
 
-# Acts have titleIds that begin with C (C2015A00040, C2026A00001, etc.)
-ACT_ID_RE = re.compile(r"^C\d{4}[A-Z]\d+$")
+# Strictly Acts: C + 4 digits + "A" + digits  (e.g. C2023A00074)
+# Excludes compilation register IDs (C####C#####) and instruments (F####L#####)
+ACT_SERIES_RE = re.compile(r"^C\d{4}A\d+$")
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; TripwireBot/1.0; "
-        "+https://github.com/ipaventures/tripwire)"
-    )
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-AU,en;q=0.9",
 }
 
 MIN_SUMMARY_WORDS = 100
@@ -89,67 +100,166 @@ def extract_title_id(url: str) -> str:
 
 
 def get_compilation(title_id: str, compilation_number: str) -> dict:
-    """Fetch a specific compilation via the FRL API."""
-    # Strip leading C/c from compilation number (C09 → 9)
+    """Fetch a specific compilation via the FRL API Versions/Find() endpoint."""
     comp_num = re.sub(r"^[Cc]", "", compilation_number).strip()
     url = (
         f"{FRL_API}/Versions/Find("
         f"titleId='{title_id}',"
         f"compilationNumber='{comp_num}')"
     )
-    log(f"FRL API → GET {url}")
+    log(f"FRL API -> {url}")
     resp = requests.get(url, headers=HEADERS, timeout=30)
     if resp.status_code == 404:
         raise RuntimeError(
-            f"Compilation '{compilation_number}' not found for '{title_id}'.\n"
-            "Check the URL and compilation number are correct."
+            f"Compilation '{compilation_number}' not found for '{title_id}'."
         )
     resp.raise_for_status()
     return resp.json()
 
 
-def get_asmade_version(title_id: str) -> dict:
-    """Fetch the as-made version of an amending Act."""
-    url = (
-        f"{FRL_API}/Versions/Find("
-        f"titleId='{title_id}',"
-        f"asAtSpecification='AsMade')"
-    )
-    log(f"FRL API (as-made) → GET {url}")
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def extract_amending_acts(version_data: dict) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Layer 3: Affect API endpoint
+# ---------------------------------------------------------------------------
+def get_amending_acts_via_affect_api(title_id: str, compilation_start: str) -> list[dict]:
     """
-    Extract amending instruments from the 'reasons' array.
-    Returns only Acts (titleId matches ACT_ID_RE).
+    Query the FRL Affect endpoint for all Acts that amended this title,
+    then filter to those whose dateChanged aligns with the compilation start date.
+
+    The Affect endpoint is the dedicated FRL API resource for amendment
+    relationships. It is more reliably populated than Version.reasons.
+
+    Args:
+        title_id: The principal Act's title ID (e.g. 'C2004A04014')
+        compilation_start: The compilation's start date from the API
+                           (ISO format, e.g. '2023-10-18T00:00:00')
+
+    Returns:
+        List of dicts with titleId, name, affect, source='affect_api'
+    """
+    # Extract date portion for comparison (2023-10-18T00:00:00 -> 2023-10-18)
+    comp_date = compilation_start[:10] if compilation_start else ""
+
+    params = urlencode({
+        "$filter": f"affectedTitleId eq '{title_id}'",
+        "$top": "50",
+    })
+    url = f"{FRL_API}/Affect?{params}"
+    log(f"  Affect API -> {url}")
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log(f"  Affect API failed: {exc}")
+        return []
+
+    results = []
+    seen: set[str] = set()
+    entries = data.get("value", data if isinstance(data, list) else [])
+
+    for entry in entries:
+        affecting_id = entry.get("affectingTitleId", "")
+        if not affecting_id or not ACT_SERIES_RE.match(affecting_id):
+            continue
+
+        # Match by date if we have one
+        if comp_date:
+            entry_date = str(entry.get("dateChanged", "") or "")[:10]
+            if entry_date and entry_date != comp_date:
+                continue
+
+        if affecting_id not in seen:
+            seen.add(affecting_id)
+            affecting_title = entry.get("affectingTitle") or {}
+            name = (
+                affecting_title.get("name", "")
+                if isinstance(affecting_title, dict)
+                else str(affecting_title)
+            )
+            results.append({
+                "titleId": affecting_id,
+                "name": name,
+                "affect": entry.get("affect", "Amend"),
+                "source": "affect_api",
+            })
+            log(f"  Found via Affect API: {affecting_id} ({name})")
+
+    # If date filtering returned nothing, retry without date constraint
+    # (handles cases where the API date field differs slightly from compilation start)
+    if not results and comp_date:
+        log("  No date-matched results — retrying Affect API without date filter ...")
+        for entry in entries:
+            affecting_id = entry.get("affectingTitleId", "")
+            if not affecting_id or not ACT_SERIES_RE.match(affecting_id):
+                continue
+            if affecting_id not in seen:
+                seen.add(affecting_id)
+                affecting_title = entry.get("affectingTitle") or {}
+                name = (
+                    affecting_title.get("name", "")
+                    if isinstance(affecting_title, dict)
+                    else str(affecting_title)
+                )
+                results.append({
+                    "titleId": affecting_id,
+                    "name": name,
+                    "affect": entry.get("affect", "Amend"),
+                    "source": "affect_api_undated",
+                })
+                log(f"  Found (undated): {affecting_id} ({name})")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Amending Act discovery — all three layers
+# ---------------------------------------------------------------------------
+def discover_amending_acts(version_data: dict) -> list[dict]:
+    """
+    Identify all Acts that amended this compilation using three layers.
+    Results are deduplicated by titleId.
     """
     seen: set[str] = set()
     results: list[dict] = []
 
-    for reason in version_data.get("reasons", []):
-        affect = reason.get("affect", "")
+    def add(act: dict) -> None:
+        tid = act.get("titleId", "")
+        if tid and tid not in seen and ACT_SERIES_RE.match(tid):
+            seen.add(tid)
+            results.append(act)
 
-        # Primary: amendedByTitle; fallback: affectedByTitle
+    title_id = version_data.get("titleId", "")
+    register_id = version_data.get("registerId", "")
+    start = version_data.get("start", "")
+
+    # --- Layer 1: registerId ---
+    if ACT_SERIES_RE.match(register_id):
+        log(f"  Layer 1 (registerId): {register_id} is an amending Act")
+        add({"titleId": register_id, "name": "", "affect": "Amend", "source": "registerId"})
+    else:
+        log(f"  Layer 1 (registerId): {register_id} is not an Act series ID")
+
+    # --- Layer 2: reasons array ---
+    reasons = version_data.get("reasons", [])
+    log(f"  Layer 2 (reasons array): {len(reasons)} reason(s)")
+    for reason in reasons:
+        affect = reason.get("affect", "")
         for key in ("amendedByTitle", "affectedByTitle"):
             obj = reason.get(key) or {}
             if not isinstance(obj, dict):
                 continue
             tid = obj.get("titleId", "")
             name = obj.get("name", "")
-            if tid and tid not in seen and ACT_ID_RE.match(tid):
-                seen.add(tid)
-                results.append(
-                    {
-                        "titleId": tid,
-                        "name": name,
-                        "affect": affect,
-                        "registerId": obj.get("registerId", ""),
-                    }
-                )
+            if tid:
+                add({"titleId": tid, "name": name, "affect": affect, "source": "reasons"})
             break
+
+    # --- Layer 3: Affect API (always run as a safety net) ---
+    log(f"  Layer 3 (Affect API): querying for affectedTitleId={title_id}")
+    affect_results = get_amending_acts_via_affect_api(title_id, start)
+    for act in affect_results:
+        add(act)
 
     return results
 
@@ -157,252 +267,214 @@ def extract_amending_acts(version_data: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 # ParlInfo URL discovery
 # ---------------------------------------------------------------------------
-def find_parlinfo_url_from_legislation_page(title_id: str) -> str | None:
+def find_parlinfo_url(amending_act_id: str) -> str | None:
     """
-    Scrape the legislation.gov.au 'as made' versions page for the amending Act
-    and look for an 'Originating Bill and Explanatory Memorandum' link that
-    points to parlinfo.aph.gov.au.
+    Scrape the amending Act's legislation.gov.au page to find the
+    "Originating Bill and Explanatory Memorandum" ParlInfo link.
+
+    The link appears on the Act's own versions page, not the principal Act's page.
     """
-    candidate_urls = [
-        f"https://www.legislation.gov.au/{title_id}/latest/versions",
-        f"https://www.legislation.gov.au/{title_id}/asmade/versions",
+    candidate_paths = [
+        f"/{amending_act_id}/latest/versions",
+        f"/{amending_act_id}/asmade/versions",
+        f"/{amending_act_id}/latest/text",
     ]
 
-    for page_url in candidate_urls:
-        log(f"Scraping legislation page → {page_url}")
+    for path in candidate_paths:
+        url = f"{LEGISLATION_BASE}{path}"
+        log(f"  Scraping -> {url}")
         try:
-            resp = requests.get(page_url, headers=HEADERS, timeout=30, allow_redirects=True)
-            if resp.status_code != 200:
-                continue
+            resp = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
         except Exception as exc:
-            log(f"  Request failed: {exc}")
+            log(f"    Request failed: {exc}")
             continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        if resp.status_code != 200:
+            log(f"    HTTP {resp.status_code}")
+            continue
 
-        # Look for any anchor pointing to parlinfo and containing bill-home query
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Strategy A: anchor href contains parlinfo + billhome
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if "parlinfo.aph.gov.au" in href and "billhome" in href.lower():
-                log(f"  Found ParlInfo link: {href}")
+                log(f"    Found: {href}")
                 return href
 
-        # Also check for links with text "Originating Bill"
+        # Strategy B: anchor text contains "Originating Bill"
         for a in soup.find_all("a", href=True):
-            text = a.get_text(strip=True).lower()
-            if "originating bill" in text and "parlinfo" in a["href"]:
-                log(f"  Found via link text: {a['href']}")
+            if (
+                "originating bill" in a.get_text(strip=True).lower()
+                and "parlinfo" in a["href"].lower()
+            ):
+                log(f"    Found via link text: {a['href']}")
                 return a["href"]
 
-    return None
+        # Strategy C: raw regex scan (catches JS-rendered or data-attribute links)
+        matches = re.findall(
+            r'https?://parlinfo\.aph\.gov\.au/parlInfo/search/display/[^\s\'"<>]+billhome[^\s\'"<>]+',
+            html,
+            re.IGNORECASE,
+        )
+        if matches:
+            log(f"    Found via regex: {matches[0]}")
+            return matches[0]
 
+        log("    No ParlInfo link found")
 
-def find_parlinfo_url_from_asmade_api(version_data: dict) -> str | None:
-    """
-    Look for a ParlInfo URL embedded in the as-made version's documents or
-    parliamentary information fields.
-    """
-    # Check top-level fields
-    for field in ("parliamentaryInformationUrl", "billHomeUrl", "emUrl"):
-        val = version_data.get(field)
-        if val and "parlinfo" in str(val).lower():
-            return val
-
-    # Check documents array for EM-type links
-    for doc in version_data.get("documents", []):
-        url = doc.get("url", "") or doc.get("downloadUrl", "")
-        if url and "parlinfo" in url.lower():
-            return url
-
-    # Check reasons for parlinfo references
-    for reason in version_data.get("reasons", []):
-        for key in ("emUrl", "billHomeUrl", "parliamentaryUrl"):
-            val = reason.get(key)
-            if val and "parlinfo" in str(val).lower():
-                return val
-
-    return None
-
-
-def build_parlinfo_search_url(bill_id: str) -> str:
-    """Build a ParlInfo bill home search URL from a bill ID like 'r7421'."""
-    query = f'Id%3A%22legislation%2Fbillhome%2F{bill_id}%22'
-    return f"{PARLINFO_BASE};query={query}"
-
-
-def extract_bill_id_from_parlinfo_url(url: str) -> str | None:
-    """Extract the bill ID (e.g. 'r7421') from a parlinfo URL."""
-    # Matches patterns like billhome/r7421 or billhome%2Fr7421
-    match = re.search(r"billhome[/%2F]+([a-z][0-9]+)", url, re.IGNORECASE)
-    if match:
-        return match.group(1)
     return None
 
 
 # ---------------------------------------------------------------------------
-# ParlInfo scraping
+# ParlInfo bill home scraping
 # ---------------------------------------------------------------------------
-def scrape_parlinfo_summary(parlinfo_url: str) -> tuple[str, str]:
+def scrape_bill_summary(parlinfo_url: str) -> tuple[str, str]:
     """
-    Scrape the bill summary from a ParlInfo bill home page.
-
+    Scrape bill title and summary from a ParlInfo bill home page.
     Returns (bill_title, summary_text).
-    The summary is extracted from:
-      - <summary> element (preferred, matches XPATH /html/body/.../summary)
-      - or content between <b class="bills">Summary</b> and
-        <b class="bills">Progress of bill</b>
+
+    Three extraction strategies:
+      1. <summary> element (XPATH: /html/body/.../summary)
+      2. Content between <b class="bills">Summary</b> and
+         <b class="bills">Progress of bill</b>
+      3. Any div/section with 'summary' in its attributes
     """
-    log(f"Scraping ParlInfo bill home → {parlinfo_url}")
+    log(f"  Scraping ParlInfo -> {parlinfo_url}")
     resp = requests.get(parlinfo_url, headers=HEADERS, timeout=30, allow_redirects=True)
     resp.raise_for_status()
-
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Extract bill title
+    # Bill title
     bill_title = ""
-    h1 = soup.find("h1")
-    if h1:
-        bill_title = h1.get_text(strip=True)
+    for selector in ["h1", "h2.bills", ".billTitle"]:
+        el = soup.select_one(selector)
+        if el:
+            bill_title = el.get_text(strip=True)
+            break
 
-    # --- Strategy 1: <summary> element (matches the XPATH in the spec) ---
+    # Strategy 1: <summary> element
     summary_el = soup.find("summary")
     if summary_el:
         text = summary_el.get_text(separator=" ", strip=True)
-        if len(text.split()) >= 20:
-            log(f"  Found summary via <summary> element ({len(text.split())} words)")
+        if len(text.split()) >= 15:
+            log(f"    <summary> element: {len(text.split())} words")
             return bill_title, text
 
-    # --- Strategy 2: content between Summary and Progress of bill markers ---
-    summary_marker = None
-    for b in soup.find_all("b", class_="bills"):
-        if "Summary" in b.get_text():
-            summary_marker = b
+    # Strategy 2: b.bills markers
+    summary_start = None
+    for b_tag in soup.find_all("b", class_="bills"):
+        if re.search(r"\bSummary\b", b_tag.get_text(), re.IGNORECASE):
+            summary_start = b_tag
             break
 
-    if summary_marker:
+    if summary_start:
         chunks = []
-        for sibling in summary_marker.parent.next_siblings:
-            # Stop when we hit the Progress of bill marker
+        for sibling in summary_start.parent.next_siblings:
             if hasattr(sibling, "find_all"):
-                if any(
-                    "Progress of bill" in b.get_text()
+                stop = any(
+                    re.search(r"Progress of bill", b.get_text(), re.IGNORECASE)
                     for b in sibling.find_all("b", class_="bills")
-                ):
+                )
+                if stop:
                     break
-                # Also stop at another major heading
-                text_chunk = sibling.get_text(separator=" ", strip=True)
-                if text_chunk:
-                    chunks.append(text_chunk)
-            elif str(sibling).strip():
+                chunk = sibling.get_text(separator=" ", strip=True)
+                if chunk:
+                    chunks.append(chunk)
+            elif str(sibling).strip() and not str(sibling).startswith("<"):
                 chunks.append(str(sibling).strip())
-
         if chunks:
             text = " ".join(chunks)
-            log(f"  Found summary via b.bills markers ({len(text.split())} words)")
+            log(f"    b.bills markers: {len(text.split())} words")
             return bill_title, text
 
-    # --- Strategy 3: broad fallback — find any div with 'summary' in class/id ---
+    # Strategy 3: div/section with 'summary' in attributes
     for tag in soup.find_all(["div", "section", "article"]):
-        attrs = " ".join(str(v) for v in tag.attrs.values()).lower()
-        if "summary" in attrs:
+        attrs_str = " ".join(str(v) for v in tag.attrs.values()).lower()
+        if "summary" in attrs_str:
             text = tag.get_text(separator=" ", strip=True)
             if len(text.split()) >= 20:
-                log(f"  Found summary via div/section fallback ({len(text.split())} words)")
+                log(f"    div/section fallback: {len(text.split())} words")
                 return bill_title, text
 
-    log("  WARNING: Could not locate summary on ParlInfo page.")
+    log("    WARNING: Could not locate summary content")
     return bill_title, ""
+
+
+# ---------------------------------------------------------------------------
+# Bills Digest fallback
+# ---------------------------------------------------------------------------
+def extract_bill_id(parlinfo_url: str) -> str | None:
+    """Extract bill ID like 'r7042' from a ParlInfo URL."""
+    match = re.search(r"billhome[/%2F]+([a-zA-Z][0-9]+)", parlinfo_url, re.IGNORECASE)
+    return match.group(1) if match else None
 
 
 def scrape_bills_digest(bill_id: str) -> str:
     """
-    Fetch the Bills Digest for a given bill ID and extract the 'Key points'
-    section (between <p>Key points</p> and <p>Contents</p>).
+    Fetch the Bills Digest and extract the Key Points section
+    (between <p>Key points</p> and <p>Contents</p>).
     """
     search_url = (
-        f"{BILLS_DIGEST_SEARCH}"
+        f"{PARLINFO_DISPLAY}"
         f";query=BillId_Phrase%3A%22{bill_id}%22%20Dataset%3Abillsdgs;rec=0"
     )
-    log(f"Scraping Bills Digest → {search_url}")
-
+    log(f"  Bills Digest -> {search_url}")
     try:
         resp = requests.get(search_url, headers=HEADERS, timeout=30, allow_redirects=True)
         resp.raise_for_status()
     except Exception as exc:
-        log(f"  Bills Digest request failed: {exc}")
+        log(f"    Bills Digest failed: {exc}")
         return ""
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Find <p> with "Key points" text
     key_points_marker = None
-    for p in soup.find_all("p"):
-        text = p.get_text(strip=True)
-        if re.search(r"key\s+points", text, re.IGNORECASE):
-            key_points_marker = p
+    for tag in soup.find_all(["p", "h2", "h3", "strong", "b"]):
+        if re.search(r"key\s+points", tag.get_text(), re.IGNORECASE):
+            key_points_marker = tag
             break
 
     if not key_points_marker:
-        # Try broader: find any element mentioning Key points
-        for tag in soup.find_all(["h2", "h3", "strong", "b"]):
-            if re.search(r"key\s+points", tag.get_text(), re.IGNORECASE):
-                key_points_marker = tag
-                break
-
-    if not key_points_marker:
-        log("  Could not find 'Key points' marker in Bills Digest.")
+        log("    'Key points' marker not found")
         return ""
 
     chunks = []
     for sibling in key_points_marker.next_siblings:
         if hasattr(sibling, "get_text"):
-            sib_text = sibling.get_text(strip=True)
-            # Stop at Contents or another structural marker
-            if re.search(r"^Contents?\s*$", sib_text, re.IGNORECASE):
+            text = sibling.get_text(strip=True)
+            if re.search(r"^\s*Contents?\s*$", text, re.IGNORECASE):
                 break
-            if re.search(r"^(Purpose|Background|Financial impact|Key issues)", sib_text):
-                # Also stop at next major section heading
-                break
-            if sib_text:
-                chunks.append(sib_text)
+            if text:
+                chunks.append(text)
         elif str(sibling).strip():
             chunks.append(str(sibling).strip())
 
     if chunks:
         text = " ".join(chunks)
-        log(f"  Found Bills Digest key points ({len(text.split())} words)")
+        log(f"    Bills Digest key points: {len(text.split())} words")
         return text
-
-    # Fallback: grab a broad section of the digest body
-    body_div = soup.find("div", class_=re.compile(r"(content|body|main)", re.I))
-    if body_div:
-        text = body_div.get_text(separator=" ", strip=True)
-        # Truncate to ~500 words
-        words = text.split()[:500]
-        return " ".join(words)
 
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Orchestration: get EM summary for one amending Act
+# Per-Act orchestration
 # ---------------------------------------------------------------------------
-def get_em_summary_for_act(amending_act: dict) -> dict:
+def process_amending_act(act: dict) -> dict:
     """
     Full pipeline for one amending Act:
-      1. Find the ParlInfo bill home URL.
-      2. Scrape the summary.
-      3. If summary < MIN_SUMMARY_WORDS, fall back to Bills Digest.
-
-    Returns a result dict.
+      1. Find the ParlInfo bill home URL (scrape legislation.gov.au)
+      2. Scrape the summary from ParlInfo
+      3. If < MIN_SUMMARY_WORDS, fall back to Bills Digest
     """
-    tid = amending_act["titleId"]
-    name = amending_act.get("name", tid)
-
+    tid = act["titleId"]
     result = {
         "titleId": tid,
-        "name": name,
-        "affect": amending_act.get("affect", ""),
+        "name": act.get("name", ""),
+        "affect": act.get("affect", ""),
+        "discovery_source": act.get("source", ""),
         "parlinfo_url": None,
         "bill_id": None,
         "bill_title": "",
@@ -411,41 +483,25 @@ def get_em_summary_for_act(amending_act: dict) -> dict:
         "status": "not_found",
     }
 
-    # --- Step A: Discover ParlInfo URL ---
-    parlinfo_url = None
-
-    # Try 1: scrape legislation.gov.au page for the amending Act
-    parlinfo_url = find_parlinfo_url_from_legislation_page(tid)
-
-    # Try 2: check the as-made API response
+    # Step 1: find ParlInfo URL
+    parlinfo_url = find_parlinfo_url(tid)
     if not parlinfo_url:
-        try:
-            asmade_data = get_asmade_version(tid)
-            parlinfo_url = find_parlinfo_url_from_asmade_api(asmade_data)
-        except Exception as exc:
-            log(f"  As-made API call failed for {tid}: {exc}")
-
-    if not parlinfo_url:
-        log(f"  Could not find ParlInfo URL for {tid}")
+        log(f"  Could not find a ParlInfo URL for {tid}")
         result["status"] = "no_parlinfo_url"
         return result
 
     result["parlinfo_url"] = parlinfo_url
+    result["bill_id"] = extract_bill_id(parlinfo_url)
 
-    # Extract bill ID for Bills Digest fallback
-    bill_id = extract_bill_id_from_parlinfo_url(parlinfo_url)
-    result["bill_id"] = bill_id
-
-    # --- Step B: Scrape ParlInfo summary ---
+    # Step 2: scrape ParlInfo bill summary
     try:
-        bill_title, summary = scrape_parlinfo_summary(parlinfo_url)
+        bill_title, summary = scrape_bill_summary(parlinfo_url)
     except Exception as exc:
         log(f"  ParlInfo scrape failed: {exc}")
         result["status"] = "scrape_error"
         return result
 
     result["bill_title"] = bill_title
-
     word_count = len(summary.split())
     log(f"  Summary word count: {word_count}")
 
@@ -455,20 +511,16 @@ def get_em_summary_for_act(amending_act: dict) -> dict:
         result["status"] = "success"
         return result
 
-    # --- Step C: Summary too short — try Bills Digest ---
-    log(f"  Summary < {MIN_SUMMARY_WORDS} words — falling back to Bills Digest …")
+    # Step 3: Bills Digest fallback
+    log(f"  < {MIN_SUMMARY_WORDS} words — trying Bills Digest ...")
+    digest = scrape_bills_digest(result["bill_id"]) if result["bill_id"] else ""
 
-    digest_text = ""
-    if bill_id:
-        digest_text = scrape_bills_digest(bill_id)
-
-    if digest_text and len(digest_text.split()) >= 30:
-        result["summary"] = digest_text
+    if digest and len(digest.split()) >= 30:
+        result["summary"] = digest
         result["summary_source"] = "bills_digest"
         result["status"] = "success"
         return result
 
-    # Keep whatever we have if it's non-empty
     if summary:
         result["summary"] = summary
         result["summary_source"] = "parlinfo_bill_home_short"
@@ -482,38 +534,31 @@ def get_em_summary_for_act(amending_act: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
-def wrap(text: str, width: int = 80, indent: str = "  ") -> str:
-    """Word-wrap a string for readable terminal/log output."""
-    return textwrap.fill(text, width=width, initial_indent=indent, subsequent_indent=indent)
-
-
 def generate_report(
     principal_title_id: str,
     compilation_label: str,
-    amending_acts: list[dict],
     results: list[dict],
 ) -> str:
-    """Build a plain-English markdown report."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        f"# EM Summary Report",
-        f"",
-        f"**Principal Act:** [{principal_title_id}](https://www.legislation.gov.au/{principal_title_id}/latest/versions)  ",
+        "# EM Summary Report",
+        "",
+        f"**Principal Act:** [{principal_title_id}]({LEGISLATION_BASE}/{principal_title_id}/latest/versions)  ",
         f"**Compilation:** {compilation_label}  ",
         f"**Generated:** {now}  ",
-        f"",
+        "",
         "---",
         "",
     ]
 
     if not results:
-        lines.append("No amending Acts found for this compilation.")
+        lines.append("No amending Acts were identified for this compilation.")
         return "\n".join(lines)
 
     success_count = sum(1 for r in results if r["status"].startswith("success"))
     lines.append(
         f"Found **{len(results)}** amending Act(s). "
-        f"Successfully retrieved summaries for **{success_count}**."
+        f"EM summaries retrieved for **{success_count}**."
     )
     lines.append("")
 
@@ -528,46 +573,39 @@ def generate_report(
 
         lines.append(f"## {i}. {name}")
         lines.append("")
-        lines.append(f"- **FRL ID:** [{tid}](https://www.legislation.gov.au/{tid}/latest/versions)")
-
+        lines.append(f"- **Amending Act:** [{tid}]({LEGISLATION_BASE}/{tid}/latest/versions)")
+        lines.append(f"- **Discovered via:** {res.get('discovery_source', '-')}")
         if bill_title and bill_title != name:
             lines.append(f"- **Bill:** {bill_title}")
-
         if parlinfo_url:
             lines.append(f"- **ParlInfo:** [{parlinfo_url}]({parlinfo_url})")
-
         if res.get("bill_id"):
             lines.append(f"- **Bill ID:** {res['bill_id']}")
-
         source_label = {
             "parlinfo_bill_home": "ParlInfo Bill Home – Summary",
-            "parlinfo_bill_home_short": "ParlInfo Bill Home – Summary (short)",
+            "parlinfo_bill_home_short": "ParlInfo Bill Home – Summary (short, < 100 words)",
             "bills_digest": "Bills Digest – Key Points",
-        }.get(source, source or "—")
+        }.get(source, source or "-")
         lines.append(f"- **Summary source:** {source_label}")
         lines.append("")
 
         if summary:
             lines.append("### Plain-English Summary")
             lines.append("")
-            # Wrap for readability (GitHub renders markdown so wrapping is fine)
             lines.append(summary)
         elif status == "no_parlinfo_url":
             lines.append(
-                "> ⚠️ Could not locate a ParlInfo bill home link for this Act. "
-                "It may be a non-parliamentary amendment (e.g. commencement instrument) "
-                "or the link was not discoverable via the legislation.gov.au page."
+                "> ⚠️ No ParlInfo bill home link found on the legislation.gov.au page for this Act. "
+                "It may be a commencement or administrative instrument with no EM, "
+                "or the page structure was unexpected."
             )
         elif status == "scrape_error":
             lines.append(
-                "> ⚠️ Found the ParlInfo URL but could not scrape summary content. "
-                "The page may require authentication or have an unusual structure."
+                "> ⚠️ Found the ParlInfo URL but could not retrieve summary content. "
+                "Check the link above manually."
             )
         else:
-            lines.append(
-                "> ⚠️ No summary text could be extracted for this Act. "
-                "Check the ParlInfo URL above manually."
-            )
+            lines.append("> ⚠️ No summary text could be extracted. Check the ParlInfo link above.")
 
         lines.append("")
         lines.append("---")
@@ -577,7 +615,6 @@ def generate_report(
 
 
 def write_step_summary(report_md: str) -> None:
-    """Write report to GitHub Actions Step Summary if available."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
@@ -586,20 +623,14 @@ def write_step_summary(report_md: str) -> None:
     log("GitHub Step Summary written.")
 
 
-def write_output_file(
-    report_md: str,
-    title_id: str,
-    compilation_label: str,
-) -> str:
-    """Write the report to a file and return the path."""
+def write_output_file(report_md: str, title_id: str, compilation_label: str) -> str:
     from pathlib import Path
-
     out_dir = Path("em_summaries") / title_id
     out_dir.mkdir(parents=True, exist_ok=True)
     filename = f"EM_summary_{title_id}_{compilation_label}.md"
     out_path = out_dir / filename
     out_path.write_text(report_md, encoding="utf-8")
-    log(f"Report written → {out_path}")
+    log(f"Report written -> {out_path}")
     return str(out_path)
 
 
@@ -611,7 +642,7 @@ def main() -> None:
         print(
             "Usage: python fetch_em_summary.py <legislation_url> <compilation_number>\n"
             "Example: python fetch_em_summary.py "
-            "https://www.legislation.gov.au/C2015A00040/latest/versions C09"
+            "https://www.legislation.gov.au/C2004A04014/latest/versions C50"
         )
         sys.exit(1)
 
@@ -619,18 +650,16 @@ def main() -> None:
     comp_input = sys.argv[2].strip().upper()
 
     log_section("FRL EM Summary Fetcher")
-    log(f"Input URL        : {url_input}")
-    log(f"Compilation      : {comp_input}")
+    log(f"Input URL   : {url_input}")
+    log(f"Compilation : {comp_input}")
 
-    # --- Step 1: Extract Title ID ---
     try:
         title_id = extract_title_id(url_input)
     except ValueError as exc:
         log(f"ERROR: {exc}")
         sys.exit(1)
-    log(f"Title ID         : {title_id}")
+    log(f"Title ID    : {title_id}")
 
-    # --- Step 2: Fetch compilation from FRL API ---
     log_section("Fetching compilation from FRL API")
     try:
         version_data = get_compilation(title_id, comp_input)
@@ -639,15 +668,18 @@ def main() -> None:
         sys.exit(1)
 
     register_id = version_data.get("registerId", "unknown")
-    log(f"Register ID      : {register_id}")
+    start = version_data.get("start", "")
+    log(f"Register ID : {register_id}")
+    log(f"Start date  : {start[:10] if start else 'unknown'}")
 
-    # --- Step 3: Extract amending Acts ---
-    log_section("Extracting amending Acts")
-    amending_acts = extract_amending_acts(version_data)
+    # Inject titleId into version_data so discover_amending_acts can use it
+    version_data.setdefault("titleId", title_id)
+
+    log_section("Discovering amending Acts")
+    amending_acts = discover_amending_acts(version_data)
 
     if not amending_acts:
-        log("No amending Acts found in this compilation's reasons array.")
-        log("This may be the as-made version, or no Acts amended this compilation.")
+        log("No amending Acts found via any discovery method.")
         report = (
             f"# EM Summary Report\n\n"
             f"**Principal Act:** {title_id}  \n"
@@ -660,37 +692,32 @@ def main() -> None:
 
     log(f"Found {len(amending_acts)} amending Act(s):")
     for act in amending_acts:
-        log(f"  • {act['titleId']}  ({act['affect']})  {act.get('name', '')}")
+        log(f"  * {act['titleId']}  (via {act['source']})  {act.get('name', '')}")
 
-    # --- Step 4: Retrieve EM summaries ---
     log_section("Retrieving EM summaries from ParlInfo")
     results = []
     for act in amending_acts:
-        log(f"\nProcessing {act['titleId']} — {act.get('name', '')} …")
-        result = get_em_summary_for_act(act)
+        log(f"\nProcessing {act['titleId']} ...")
+        result = process_amending_act(act)
         results.append(result)
 
-    # --- Step 5: Generate and write report ---
     log_section("Generating report")
-    report_md = generate_report(title_id, comp_input, amending_acts, results)
+    report_md = generate_report(title_id, comp_input, results)
 
-    # Print to stdout
     print("\n" + "=" * 60)
     print(report_md)
     print("=" * 60)
 
-    # Write to file and GitHub Step Summary
     out_path = write_output_file(report_md, title_id, comp_input)
     write_step_summary(report_md)
 
-    # --- Step 6: Exit status ---
     success_count = sum(1 for r in results if r["status"].startswith("success"))
     log_section("Complete")
     log(f"{success_count}/{len(results)} summaries retrieved.")
-    log(f"Report saved to: {out_path}")
+    log(f"Report saved -> {out_path}")
 
     if success_count == 0:
-        log("WARNING: No summaries could be retrieved. Exiting with code 1.")
+        log("WARNING: No summaries retrieved. Exiting with code 1.")
         sys.exit(1)
 
 
