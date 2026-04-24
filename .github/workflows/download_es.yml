@@ -1,0 +1,45 @@
+name: Download Amending ES Documents
+
+on:
+  workflow_dispatch:
+    inputs:
+      legislation_url:
+        description: 'URL of the regulation'
+        required: true
+        default: 'https://www.legislation.gov.au/F1996B00084/latest/text'
+      compilation_number:
+        description: 'Compilation Number (e.g., C51)'
+        required: true
+        default: 'C51'
+
+jobs:
+  download-and-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Run Download Script
+        env:
+          URL: ${{ github.event.inputs.legislation_url }}
+          COMP_NUM: ${{ github.event.inputs.legislation_url }}
+        run: python download_es.py "${{ github.event.inputs.legislation_url }}" "${{ github.event.inputs.compilation_number }}"
+
+      - name: Commit and Push ES Documents
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads/*.docx
+          git commit -m "Add ES documents for compilation ${{ github.event.inputs.compilation_number }}" || echo "No changes to commit"
+          git push
