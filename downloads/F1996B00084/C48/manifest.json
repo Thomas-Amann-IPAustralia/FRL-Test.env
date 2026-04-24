@@ -1,0 +1,22 @@
+{
+  "titleId": "F1996B00084",
+  "compilation": "C48",
+  "amendingInstruments": [
+    {
+      "titleId": "F2024L00297",
+      "name": "",
+      "affect": "Amend"
+    }
+  ],
+  "downloads": [
+    {
+      "titleId": "F2024L00297",
+      "status": "success",
+      "type": "ES (web)",
+      "source": "web",
+      "filename": "ES_F2024L00297_C48.docx",
+      "http_status": 200,
+      "error": null
+    }
+  ]
+}
