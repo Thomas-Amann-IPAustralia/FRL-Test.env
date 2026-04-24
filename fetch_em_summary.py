@@ -340,41 +340,131 @@ def find_parlinfo_url(amending_act_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # ParlInfo bill home scraping
 # ---------------------------------------------------------------------------
-def scrape_bill_summary(parlinfo_url: str) -> tuple[str, str]:
+def _fetch_parlinfo_html(parlinfo_url: str) -> str:
     """
-    Scrape bill title and summary from a ParlInfo bill home page.
-    Returns (bill_title, summary_text).
+    Fetch HTML from a ParlInfo URL, trying the ; and ? forms and two header sets.
+    Returns the HTML string, or raises on complete failure.
     """
-    log(f"  Scraping ParlInfo -> {parlinfo_url}")
-    resp = requests.get(parlinfo_url, headers=HEADERS, timeout=30, allow_redirects=True)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # ParlInfo uses semicolons as path parameter separators.
+    # Try both ; and ? forms in case the server prefers one.
+    url_variants = [parlinfo_url]
+    if ";" in parlinfo_url:
+        url_variants.append(parlinfo_url.replace(";", "?", 1))
 
+    header_sets = [
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-AU,en-GB;q=0.9,en;q=0.8",
+            "Referer": "https://www.legislation.gov.au/",
+        },
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.4 Safari/605.1.15"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-AU,en;q=0.5",
+            "Referer": "https://www.aph.gov.au/",
+        },
+    ]
+
+    last_status = None
+    for url in url_variants:
+        for headers in header_sets:
+            log(f"    GET {url[:100]}")
+            try:
+                resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+                last_status = resp.status_code
+                if resp.status_code == 200 and len(resp.text) > 200:
+                    log(f"    HTTP 200 ({len(resp.text)} chars)")
+                    return resp.text
+                log(f"    HTTP {resp.status_code}")
+            except Exception as exc:
+                log(f"    Request error: {exc}")
+
+    raise RuntimeError(
+        f"Could not retrieve ParlInfo page after all attempts "
+        f"(last status: {last_status}). URL: {parlinfo_url}"
+    )
+
+
+def _extract_summary_from_html(html: str) -> tuple[str, str]:
+    """
+    Extract (bill_title, summary_text) from a ParlInfo bill home HTML page.
+
+    ParlInfo uses HTML5 <details>/<summary> accordions. The page structure is:
+      <details>
+        <summary><b class="bills">Summary</b></summary>  ← XPATH target
+        <p>Actual summary content...</p>
+        ...
+      </details>
+      <details>
+        <summary><b class="bills">Progress of bill</b></summary>
+        ...
+      </details>
+
+    The <summary> tag is the HEADING of the accordion, not the content.
+    We must extract the sibling elements INSIDE <details> that follow <summary>.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Bill title
     bill_title = ""
-    for selector in ["h1", "h2.bills", ".billTitle"]:
+    for selector in ["h1", "h2.bills", ".billTitle", "title"]:
         el = soup.select_one(selector)
         if el:
-            bill_title = el.get_text(strip=True)
-            break
+            candidate = el.get_text(strip=True)
+            # Skip generic page titles
+            if len(candidate) > 10 and "parlinfo" not in candidate.lower():
+                bill_title = candidate
+                break
 
-    # Strategy 1: <summary> element (XPATH: /html/body/.../summary)
-    summary_el = soup.find("summary")
-    if summary_el:
-        text = summary_el.get_text(separator=" ", strip=True)
-        if len(text.split()) >= 15:
-            log(f"    <summary> element: {len(text.split())} words")
+    # -----------------------------------------------------------------------
+    # Strategy 1: <details> element whose <summary> heading says "Summary"
+    # Extract content from INSIDE <details> AFTER the <summary> heading.
+    # XPATH: /html/body/div[2]/div[2]/div/div[2]/div/div[1]/summary
+    # -----------------------------------------------------------------------
+    for details in soup.find_all("details"):
+        heading = details.find("summary")
+        if not heading:
+            continue
+        heading_text = heading.get_text(strip=True)
+        if not re.search(r"\bSummary\b", heading_text, re.IGNORECASE):
+            continue
+        # Collect all content nodes inside <details> that are not the heading
+        chunks = []
+        for child in details.children:
+            if child is heading:
+                continue
+            if hasattr(child, "get_text"):
+                text = child.get_text(separator=" ", strip=True)
+                if text:
+                    chunks.append(text)
+        if chunks:
+            text = " ".join(chunks)
+            log(f"    <details>/<summary> pattern: {len(text.split())} words")
             return bill_title, text
 
-    # Strategy 2: content between b.bills Summary and Progress of bill
-    summary_start = None
+    # -----------------------------------------------------------------------
+    # Strategy 2: legacy b.bills marker layout
+    # Content between <b class="bills">Summary</b> and
+    # <b class="bills">Progress of bill</b>
+    # -----------------------------------------------------------------------
+    summary_b = None
     for b_tag in soup.find_all("b", class_="bills"):
         if re.search(r"\bSummary\b", b_tag.get_text(), re.IGNORECASE):
-            summary_start = b_tag
+            summary_b = b_tag
             break
 
-    if summary_start:
+    if summary_b:
         chunks = []
-        for sibling in summary_start.parent.next_siblings:
+        for sibling in summary_b.parent.next_siblings:
             if hasattr(sibling, "find_all"):
                 stop = any(
                     re.search(r"Progress of bill", b.get_text(), re.IGNORECASE)
@@ -385,24 +475,37 @@ def scrape_bill_summary(parlinfo_url: str) -> tuple[str, str]:
                 chunk = sibling.get_text(separator=" ", strip=True)
                 if chunk:
                     chunks.append(chunk)
-            elif str(sibling).strip() and not str(sibling).startswith("<"):
-                chunks.append(str(sibling).strip())
+            elif hasattr(sibling, "strip"):
+                text = str(sibling).strip()
+                if text and not text.startswith("<"):
+                    chunks.append(text)
         if chunks:
             text = " ".join(chunks)
-            log(f"    b.bills markers: {len(text.split())} words")
+            log(f"    b.bills legacy markers: {len(text.split())} words")
             return bill_title, text
 
-    # Strategy 3: div/section with 'summary' in attributes
-    for tag in soup.find_all(["div", "section", "article"]):
-        attrs_str = " ".join(str(v) for v in tag.attrs.values()).lower()
-        if "summary" in attrs_str:
-            text = tag.get_text(separator=" ", strip=True)
-            if len(text.split()) >= 20:
-                log(f"    div/section fallback: {len(text.split())} words")
-                return bill_title, text
+    # -----------------------------------------------------------------------
+    # Strategy 3: any <details> block (fall through for unusual structures)
+    # -----------------------------------------------------------------------
+    for details in soup.find_all("details"):
+        text = details.get_text(separator=" ", strip=True)
+        if len(text.split()) >= 30:
+            log(f"    <details> fallback: {len(text.split())} words")
+            return bill_title, text
 
-    log("    WARNING: Could not locate summary content")
+    log("    WARNING: Could not locate summary content in HTML")
     return bill_title, ""
+
+
+def scrape_bill_summary(parlinfo_url: str) -> tuple[str, str]:
+    """
+    Fetch and parse a ParlInfo bill home page.
+    Returns (bill_title, summary_text).
+    Raises RuntimeError if the page cannot be fetched.
+    """
+    log(f"  Scraping ParlInfo -> {parlinfo_url}")
+    html = _fetch_parlinfo_html(parlinfo_url)
+    return _extract_summary_from_html(html)
 
 
 # ---------------------------------------------------------------------------
