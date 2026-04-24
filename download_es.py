@@ -6,7 +6,6 @@ import requests
 BASE_URL = "https://api.prod.legislation.gov.au/v1"
 
 def extract_title_id(url):
-    # Regex to pull the Title ID (e.g., F1996B00084) from the URL
     match = re.search(r'/(?P<id>[A-Z0-9]{11})', url)
     if not match:
         raise ValueError(f"Could not extract Title ID from URL: {url}")
@@ -22,54 +21,49 @@ def download_es():
     clean_comp = comp_number.lstrip('C')
     title_id = extract_title_id(url_input)
 
-    print(f"Targeting Title: {title_id} | Compilation: {comp_number}")
+    print(f"--- Diagnostic Start ---")
+    print(f"Targeting Title: {title_id}")
+    print(f"Targeting Compilation: {clean_comp}")
 
-    # --- UPDATED URL ---
-    # Added ?$expand=reasons($expand=affect) to force the API to send full objects
-    # Ref: GET /v1/Versions (with $expand=Reasons)
+    # Use $expand to get the 'affect' details
     version_url = (
         f"{BASE_URL}/Versions/Find(titleId='{title_id}',compilationNumber='{clean_comp}')"
         f"?$expand=reasons($expand=affect)"
     )
     
-    print(f"Searching for compilation details at: {version_url}")
     response = requests.get(version_url)
-    
     if response.status_code != 200:
-        print(f"Error fetching version: {response.status_code}")
+        print(f"CRITICAL: API could not find this version. Status: {response.status_code}")
         return
 
     version_data = response.json()
     reasons = version_data.get('reasons', [])
+    print(f"Found {len(reasons)} reason entries for this compilation.")
 
     amending_ids = set()
     for reason in reasons:
-        # Check 'amendedByTitle' first, which is often a direct ID string
-        direct_id = reason.get('amendedByTitle')
-        if isinstance(direct_id, str):
-            amending_ids.add(direct_id)
+        # Checking multiple fields for the amending ID
+        aid = reason.get('amendedByTitle')
+        if aid:
+            amending_ids.add(aid)
         
-        # Then check the 'affect' object
         affect = reason.get('affect')
-        # DEFENSIVE CHECK: Only call .get() if affect is actually a dictionary
         if isinstance(affect, dict):
-            amending_id = affect.get('affectingTitleId')
-            if amending_id:
-                amending_ids.add(amending_id)
-        elif isinstance(affect, str) and len(affect) == 11:
-            # If 'affect' came back as a string ID instead of an object
-            amending_ids.add(affect)
+            affect_id = affect.get('affectingTitleId')
+            if affect_id:
+                amending_ids.add(affect_id)
+
+    print(f"Unique Amending IDs found: {amending_ids}")
 
     if not amending_ids:
-        print("No amending Title IDs found in version reasons.")
+        print("No amending Title IDs were identified from the reasons.")
         return
 
     os.makedirs("downloads", exist_ok=True)
 
     for amd_id in amending_ids:
-        print(f"Fetching ES for amending title: {amd_id}...")
-        
-        # Ref: GET /v1/documents/find with type='ES'
+        # We look for the ES in Word format
+        # Note: If 'Word' fails, it might only exist as 'Pdf'
         doc_find_url = (
             f"{BASE_URL}/documents/find("
             f"titleid='{amd_id}',"
@@ -78,15 +72,17 @@ def download_es():
             f"format='Word')"
         )
         
+        print(f"Attempting download for {amd_id}...")
         doc_resp = requests.get(doc_find_url)
         
         if doc_resp.status_code == 200:
             filename = f"downloads/ES_{amd_id}_for_{comp_number}.docx"
             with open(filename, "wb") as f:
                 f.write(doc_resp.content)
-            print(f"Successfully saved: {filename}")
+            print(f"SUCCESS: Saved {filename}")
         else:
-            print(f"Could not find Word ES for {amd_id} (Status: {doc_resp.status_code})")
+            print(f"FAILED: No Word ES found for {amd_id} (Status {doc_resp.status_code}).")
+            print(f"TIP: This document might only have a PDF version on the register.")
 
 if __name__ == "__main__":
     download_es()
