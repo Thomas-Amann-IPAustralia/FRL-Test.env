@@ -340,57 +340,80 @@ def find_parlinfo_url(amending_act_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # ParlInfo bill home scraping
 # ---------------------------------------------------------------------------
-def _fetch_with_playwright(url: str) -> str:
+def _fetch_with_stealth(url: str) -> str:
     """
-    Fetch a page using a headless Chromium browser via playwright.
-    This passes Azure WAF JS challenges that block plain HTTP clients.
+    Fetch a page using selenium-stealth + headless Chromium.
+
+    selenium-stealth patches navigator.webdriver and other automation
+    fingerprints that Azure WAF JS Challenge detects. Playwright does NOT
+    patch these properties, which is why it still receives 403.
     """
-    from playwright.sync_api import sync_playwright
-    log(f"    Playwright: launching Chromium for {url[:80]}")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-AU",
-            extra_http_headers={"Referer": "https://www.legislation.gov.au/"},
-        )
-        page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=45000)
-        # Give the WAF JS challenge time to execute and redirect
-        page.wait_for_load_state("networkidle")
-        html = page.content()
-        browser.close()
-    log(f"    Playwright: got {len(html)} chars")
-    return html
+    import time
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium_stealth import stealth
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=en-AU")
+
+    service = Service("/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=options)
+
+    stealth(
+        driver,
+        languages=["en-AU", "en"],
+        vendor="Google Inc.",
+        platform="Win32",
+        webgl_vendor="Intel Inc.",
+        renderer="Intel Iris OpenGL Engine",
+        fix_hairline=True,
+    )
+
+    log(f"    stealth: navigating to {url[:80]}")
+    try:
+        driver.get(url)
+        # Poll until the WAF JS challenge resolves and the real page loads.
+        for _ in range(20):  # up to 10 seconds
+            time.sleep(0.5)
+            if "Azure WAF" not in driver.page_source:
+                break
+        html = driver.page_source
+        log(f"    stealth: got {len(html)} chars")
+        return html
+    finally:
+        driver.quit()
 
 
 def _fetch_parlinfo_html(parlinfo_url: str) -> str:
     """
     Fetch HTML from a ParlInfo URL.
 
-    ParlInfo (parlinfo.aph.gov.au) is protected by an Azure WAF JS Challenge
-    that returns HTTP 403 to plain HTTP clients regardless of headers. A real
-    browser is required to pass the JavaScript challenge.
-
-    Primary:  playwright (headless Chromium) — passes the WAF challenge.
-    Fallback: requests — used if playwright is not installed, or for testing.
+    parlinfo.aph.gov.au is protected by an Azure WAF JS Challenge that
+    blocks all plain HTTP clients (requests, vanilla playwright) because
+    they expose navigator.webdriver=true. selenium-stealth patches this
+    and other automation fingerprints so the challenge passes normally.
     """
-    # Try playwright first
+    # Primary: selenium-stealth
     try:
-        html = _fetch_with_playwright(parlinfo_url)
+        html = _fetch_with_stealth(parlinfo_url)
         if len(html) > 500 and "Azure WAF" not in html:
             return html
-        log(f"    Playwright returned WAF page or short response — unexpected")
+        preview = html[:300].replace("\n", " ")
+        log(f"    stealth: still got WAF page — preview: {preview!r}")
     except ImportError:
-        log("    playwright not installed — falling back to requests")
+        log("    selenium-stealth not installed — falling back to requests")
     except Exception as exc:
-        log(f"    Playwright failed: {exc} — falling back to requests")
+        log(f"    stealth failed: {exc} — falling back to requests")
 
-    # Fallback: requests (will 403 on the live site but useful for local testing)
+    # Fallback: requests (useful for local testing against non-WAF sites)
     url_variants = [parlinfo_url]
     if ";" in parlinfo_url:
         url_variants.append(parlinfo_url.replace(";", "?", 1))
@@ -422,8 +445,7 @@ def _fetch_parlinfo_html(parlinfo_url: str) -> str:
 
     raise RuntimeError(
         f"Could not retrieve ParlInfo page (last status: {last_status}). "
-        f"Ensure playwright is installed: pip install playwright && "
-        f"playwright install chromium --with-deps"
+        f"URL: {parlinfo_url}"
     )
 
 
