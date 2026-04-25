@@ -1,5 +1,13 @@
 name: Fetch EM Summary
 
+# ---------------------------------------------------------------------------
+# Manual trigger. The user supplies two inputs:
+#   legislation_url      — any legislation.gov.au URL for the principal Act
+#   compilation_number   — the specific compilation to inspect (e.g. C50)
+#
+# The workflow finds every Act that amended that compilation, retrieves a
+# plain-English EM summary from ParlInfo, and commits the report to the repo.
+# ---------------------------------------------------------------------------
 on:
   workflow_dispatch:
     inputs:
@@ -12,8 +20,6 @@ on:
       compilation_number:
         description: >
           Compilation number to inspect (e.g. C09 or C47).
-          The script finds every Act that amended this compilation and
-          retrieves a plain-English EM summary from ParlInfo.
         required: true
         type: string
 
@@ -23,38 +29,68 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
+      # contents: write is required both for the upload-artifact action and
+      # for the git push that commits the report to the repository.
       contents: write
 
     steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      #
+      # fetch-depth: 0 pulls the full history so that git log and git blame
+      # work correctly and the commit appears as a genuine continuation of the
+      # branch rather than an orphaned commit on a shallow clone.
+      # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # -----------------------------------------------------------------------
+      # 2. Python
+      # -----------------------------------------------------------------------
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       # -----------------------------------------------------------------------
-      # Install system Chromium + chromedriver
+      # 3. Chromium + chromedriver
       #
-      # ParlInfo (parlinfo.aph.gov.au) uses an Azure WAF JS Challenge.
-      # selenium-stealth drives a real Chromium instance with patched
-      # automation fingerprints (navigator.webdriver=false, etc.) so the
-      # challenge executes and resolves normally.
+      # parlinfo.aph.gov.au is protected by an Azure WAF JS Challenge that
+      # returns HTTP 403 to all plain HTTP clients. The challenge executes
+      # JavaScript to verify the client is a real browser before serving content.
       #
-      # chromium-browser and chromium-chromedriver are available as standard
-      # apt packages on ubuntu-latest and install to /usr/bin/chromedriver.
+      # selenium-stealth patches navigator.webdriver (and other automation
+      # fingerprints) so that headless Chromium passes the WAF's JS checks.
+      # Playwright does NOT patch these properties and also receives 403.
+      #
+      # We install Chromium via apt rather than the setup-chrome action because:
+      #   - apt packages are pre-cached on ubuntu-latest runners (~15 s vs ~60 s)
+      #   - chromium-chromedriver installs to /usr/bin/chromedriver, the path
+      #     hardcoded in fetch_em_summary.py
       # -----------------------------------------------------------------------
       - name: Install Chromium and chromedriver
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y chromium-browser chromium-chromedriver
 
+      # -----------------------------------------------------------------------
+      # 4. Python dependencies
+      # -----------------------------------------------------------------------
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install requests beautifulsoup4 lxml selenium selenium-stealth
 
+      # -----------------------------------------------------------------------
+      # 5. Run the EM summary fetcher
+      #
+      # The script exits with code 1 if no summaries were retrieved, causing
+      # this step (and the job) to fail visibly in the Actions UI. The
+      # subsequent commit step runs conditionally so partial results are still
+      # saved even on failure.
+      # -----------------------------------------------------------------------
       - name: Fetch EM Summary
         env:
           LEGISLATION_URL: ${{ inputs.legislation_url }}
@@ -64,6 +100,58 @@ jobs:
             "$LEGISLATION_URL" \
             "$COMPILATION_NUMBER"
 
+      # -----------------------------------------------------------------------
+      # 6. Commit report to repository
+      #
+      # WHY commit directly rather than relying solely on upload-artifact:
+      # Artifacts are ephemeral (deleted after 30 days by default) and
+      # require navigating the Actions UI to access. Committing the markdown
+      # file to the repo makes it permanently browsable, diffable, linkable,
+      # and available to downstream Tripwire pipelines via the GitHub API.
+      #
+      # WHY if: always():
+      # We commit even if the fetch step failed (exit code 1) so that partial
+      # results — e.g. one of two amending Acts retrieved successfully — are
+      # still persisted to the repo.
+      #
+      # WHY git config user.email github-actions[bot]:
+      # GitHub Actions requires an identity for git commits. Using the
+      # github-actions bot identity is the standard convention; it attributes
+      # automated commits clearly in the git log and does not require any
+      # repository secrets or personal access tokens.
+      #
+      # WHY check for changes before committing:
+      # If the script produced no output file (e.g. crashed before write_output_file),
+      # git diff --quiet will be true and we skip the commit rather than
+      # creating an empty "no changes" commit on the branch.
+      # -----------------------------------------------------------------------
+      - name: Commit report to repository
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add em_summaries/
+
+          if git diff --staged --quiet; then
+            echo "No new report files to commit."
+          else
+            # Build a concise commit message that identifies the run parameters
+            # so the git log is meaningful without opening each commit.
+            TITLE_ID=$(echo "${{ inputs.legislation_url }}" | grep -oP '[A-Z][0-9]{4}[A-Z][0-9]{5,6}' | head -1)
+            COMP="${{ inputs.compilation_number }}"
+            git commit -m "EM summary: ${TITLE_ID} ${COMP} [automated]"
+            git push
+            echo "Report committed and pushed to repository."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 7. Upload artifact (belt-and-braces)
+      #
+      # The artifact upload provides an additional download point for the run
+      # and a ZIP bundle of all reports generated in this run. It is useful
+      # when browsing a specific run's outputs rather than the repo tree.
+      # -----------------------------------------------------------------------
       - name: Upload report artifact
         if: always()
         uses: actions/upload-artifact@v4
