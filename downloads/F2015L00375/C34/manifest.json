@@ -1,0 +1,22 @@
+{
+  "titleId": "F2015L00375",
+  "compilation": "C34",
+  "amendingInstruments": [
+    {
+      "titleId": "F2025L00047",
+      "name": "",
+      "affect": "Amend"
+    }
+  ],
+  "downloads": [
+    {
+      "titleId": "F2025L00047",
+      "status": "success",
+      "type": "ES (web)",
+      "source": "web",
+      "filename": "ES_F2025L00047_C34.docx",
+      "http_status": 200,
+      "error": null
+    }
+  ]
+}
