@@ -109,10 +109,13 @@ def get_compilation(title_id: str, compilation_number: str) -> dict:
 # ---------------------------------------------------------------------------
 # Amending Act discovery (three layers)
 # ---------------------------------------------------------------------------
-def _add_act(seen: set, results: list, tid: str, name: str, affect: str, source: str) -> None:
+def _add_act(seen: set, results: list, tid: str, name: str, affect: str, source: str) -> bool:
+    """Add an amending Act to results if valid. Returns True if added."""
     if tid and tid not in seen and ACT_SERIES_RE.match(tid):
         seen.add(tid)
         results.append({"titleId": tid, "name": name, "affect": affect, "source": source})
+        return True
+    return False
 
 
 def discover_amending_acts(version_data: dict) -> list[dict]:
@@ -131,11 +134,16 @@ def discover_amending_acts(version_data: dict) -> list[dict]:
         log(f"  Layer 1 (registerId): {register_id} is not an Act series ID")
 
     # Layer 2: reasons array
+    # Check BOTH amendedByTitle AND affectedByTitle for each reason —
+    # do NOT break after the first one, as amendedByTitle.titleId is sometimes
+    # empty while affectedByTitle has the Act ID (or vice versa).
+    # Also scan the markdown field for Act IDs as a last resort.
     reasons = version_data.get("reasons", [])
     log(f"  Layer 2 (reasons): {len(reasons)} reason(s)")
     for i, reason in enumerate(reasons):
         affect = reason.get("affect", "Amend")
         log(f"    reason[{i}]: affect={affect!r} keys={list(reason.keys())}")
+        found_via_title = False
         for key in ("amendedByTitle", "affectedByTitle"):
             obj = reason.get(key) or {}
             if not isinstance(obj, dict):
@@ -144,32 +152,46 @@ def discover_amending_acts(version_data: dict) -> list[dict]:
             tid  = obj.get("titleId", "")
             name = obj.get("name", "")
             log(f"      {key}: titleId={tid!r} matches={bool(ACT_SERIES_RE.match(tid)) if tid else False}")
-            if tid:
-                _add_act(seen, results, tid, name, affect, f"reasons[{i}].{key}")
-            break
+            if tid and _add_act(seen, results, tid, name, affect, f"reasons[{i}].{key}"):
+                found_via_title = True
+        # Fallback: scan markdown field for embedded Act IDs (C####A##### pattern)
+        if not found_via_title:
+            markdown = reason.get("markdown", "") or ""
+            for tid in re.findall(r'C\d{4}A\d+', markdown) if markdown else []:
+                log(f"      markdown scan: found {tid!r}")
+                _add_act(seen, results, tid, "", affect, f"reasons[{i}].markdown")
 
     # Layer 3: Affect API
     comp_date = start[:10] if start else ""
     log(f"  Layer 3 (Affect API): affectedTitleId={title_id}, date={comp_date}")
     filter_expr = f"affectedTitleId eq '{title_id}'"
-    url = f"{FRL_API}/Affect?$filter={quote(filter_expr)}&$top=50"
-    log(f"  Affect API -> {url}")
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        entries = resp.json().get("value", [])
-        log(f"  Affect API returned {len(entries)} entries")
-        matched = [e for e in entries if str(e.get("dateChanged", ""))[:10] == comp_date] if comp_date else entries
-        if not matched and comp_date:
-            log("  No date-matched entries — using all entries")
-            matched = entries
-        for entry in matched:
-            tid = entry.get("affectingTitleId", "")
-            obj = entry.get("affectingTitle") or {}
-            name = obj.get("name", "") if isinstance(obj, dict) else ""
-            _add_act(seen, results, tid, name, entry.get("affect", "Amend"), "affect_api")
-    except Exception as exc:
-        log(f"  Affect API failed: {exc}")
+    # Try both endpoint names — /v1/Affect (EntitySet) and /v1/_AffectsSearch (search context)
+    affect_endpoints = [
+        f"{FRL_API}/_AffectsSearch?$filter={quote(filter_expr)}&$top=50",
+        f"{FRL_API}/Affect?$filter={quote(filter_expr)}&$top=50",
+    ]
+    for url in affect_endpoints:
+        log(f"  Affect API -> {url}")
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            if resp.status_code == 404:
+                log(f"  404 — trying next endpoint")
+                continue
+            resp.raise_for_status()
+            entries = resp.json().get("value", [])
+            log(f"  Affect API returned {len(entries)} entries")
+            matched = [e for e in entries if str(e.get("dateChanged", ""))[:10] == comp_date] if comp_date else entries
+            if not matched and comp_date:
+                log("  No date-matched entries — using all entries")
+                matched = entries
+            for entry in matched:
+                tid = entry.get("affectingTitleId", "")
+                obj = entry.get("affectingTitle") or {}
+                name = obj.get("name", "") if isinstance(obj, dict) else ""
+                _add_act(seen, results, tid, name, entry.get("affect", "Amend"), "affect_api")
+            break  # success — don't try next endpoint
+        except Exception as exc:
+            log(f"  Affect API failed: {exc}")
 
     return results
 
