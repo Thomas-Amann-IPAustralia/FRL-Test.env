@@ -1,5 +1,3 @@
-NEW
-
 """
 fetch_em_summary.py
 ====================
