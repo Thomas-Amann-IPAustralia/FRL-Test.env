@@ -1,0 +1,22 @@
+{
+  "titleId": "F1996B00084",
+  "compilation": "C53",
+  "amendingInstruments": [
+    {
+      "titleId": "F2025L01380",
+      "name": "",
+      "affect": "Amend"
+    }
+  ],
+  "downloads": [
+    {
+      "titleId": "F2025L01380",
+      "status": "success",
+      "type": "ES (web)",
+      "source": "web",
+      "filename": "ES_F2025L01380_C53.docx",
+      "http_status": 200,
+      "error": null
+    }
+  ]
+}
